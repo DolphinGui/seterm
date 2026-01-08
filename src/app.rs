@@ -1,14 +1,36 @@
-use crate::event::{AppEvent, Event, EventHandler};
-use ratatui::{
-    DefaultTerminal,
-    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+use crate::{
+    event::{AppEvent, Event, EventHandler},
+    ui::render_ui,
 };
+use ratatui::{
+    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+    widgets::ScrollbarState,
+    DefaultTerminal,
+};
+
+#[derive(Debug)]
+pub struct Status {
+    pub cts: bool,
+    pub dtr: bool,
+}
+
+#[derive(Debug)]
+pub struct TerminalStatus {
+    // should be using something like smol_string, which is immutable and may have better perf
+    // but for now we don't care
+    pub text: Vec<String>,
+    pub scroll_index: usize,
+    pub scroll_state: ScrollbarState,
+}
 
 #[derive(Debug)]
 pub struct App {
     pub running: bool,
     pub counter: u8,
     pub events: EventHandler,
+    pub term_input: String,
+    pub term_state: TerminalStatus,
+    pub status: Status,
 }
 
 impl Default for App {
@@ -17,6 +39,16 @@ impl Default for App {
             running: true,
             counter: 0,
             events: EventHandler::new(),
+            term_input: String::new(),
+            term_state: TerminalStatus {
+                text: Vec::new(),
+                scroll_index: 0,
+                scroll_state: ScrollbarState::new(0).viewport_content_length(1),
+            },
+            status: Status {
+                cts: false,
+                dtr: false,
+            },
         }
     }
 }
@@ -26,19 +58,19 @@ impl App {
         Self::default()
     }
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
+        use crossterm::event::{Event::Key, KeyEventKind::Press};
+        use Event::{App, Crossterm, Tick};
         while self.running {
-            terminal.draw(|frame| frame.render_widget(&self, frame.area()))?;
+            terminal.draw(|frame| render_ui(&mut self, frame))?;
             match self.events.next().await? {
-                Event::Tick => self.tick(),
-                Event::Crossterm(event) => match event {
-                    crossterm::event::Event::Key(key_event)
-                        if key_event.kind == crossterm::event::KeyEventKind::Press =>
-                    {
-                        self.handle_key_events(key_event)?
+                Tick => self.tick(),
+                Crossterm(Key(event)) => {
+                    if event.kind == Press {
+                        self.handle_key_events(event)?
                     }
-                    _ => {}
-                },
-                Event::App(app_event) => match app_event {
+                }
+                Crossterm(_) => {}
+                App(app_event) => match app_event {
                     AppEvent::Increment => self.increment_counter(),
                     AppEvent::Decrement => self.decrement_counter(),
                     AppEvent::Quit => self.quit(),
@@ -49,14 +81,23 @@ impl App {
     }
 
     pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        use KeyCode::{Char, Esc, Left, Right};
         match key_event.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.events.send(AppEvent::Quit),
-            KeyCode::Char('c' | 'C') if key_event.modifiers == KeyModifiers::CONTROL => {
+            Esc => self.events.send(AppEvent::Quit),
+            Char('c' | 'C') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.events.send(AppEvent::Quit)
             }
-            KeyCode::Right => self.events.send(AppEvent::Increment),
-            KeyCode::Left => self.events.send(AppEvent::Decrement),
-            // Other handlers you could add here.
+            Char('d' | 'D') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.status.dtr = !self.status.dtr;
+            }
+            Char('f' | 'F') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.status.cts = !self.status.cts;
+            }
+            Char(c) if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.term_input.push(c)
+            }
+            Right => self.events.send(AppEvent::Increment),
+            Left => self.events.send(AppEvent::Decrement),
             _ => {}
         }
         Ok(())
