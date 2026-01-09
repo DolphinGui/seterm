@@ -1,5 +1,5 @@
 use crate::{
-    event::{AppEvent, EventHandler, ToAppMsg},
+    event::{pseudo_serial, AppEvent, EventHandler, FromAppMsg, ToAppMsg},
     ui::render_ui,
 };
 use ratatui::{
@@ -14,6 +14,7 @@ use color_eyre::Result;
 pub struct Status {
     pub cts: bool,
     pub dtr: bool,
+    pub device: String,
 }
 
 #[derive(Debug)]
@@ -49,13 +50,14 @@ impl App {
             events: EventHandler::new(),
             term_input: String::new(),
             term_state: TerminalStatus {
-                text: Vec::new(),
+                text: vec!["".into()],
                 scroll_index: 0,
-                scroll_state: ScrollbarState::new(0).viewport_content_length(1),
+                scroll_state: ScrollbarState::new(1).viewport_content_length(1),
             },
             status: Status {
                 cts: false,
                 dtr: false,
+                device: "None".into(),
             },
         }
     }
@@ -74,6 +76,8 @@ impl App {
                 Crossterm(_) => {}
                 App(AppEvent::Quit) => self.running = false,
                 ToAppMsg::RecieveSerial(s) => self.handle_serial(s),
+                ToAppMsg::SerialGone => self.status.device = "None".into(),
+                ToAppMsg::SerialConnected(s) => self.status.device = s,
             }
         }
         Ok(())
@@ -83,8 +87,14 @@ impl App {
         use KeyCode::{Char, Esc};
         match key_event.code {
             Esc => self.events.send_self(AppEvent::Quit),
-            Char('c' | 'C') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+            Char('c') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.events.send_self(AppEvent::Quit)
+            }
+            Char('s') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.events.send(FromAppMsg::ConnectDevice(pseudo_serial()));
+            }
+            Char('x') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.events.send(FromAppMsg::DisconnectSerial);
             }
             Char('d' | 'D') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.status.dtr = !self.status.dtr;
@@ -100,7 +110,17 @@ impl App {
         Ok(())
     }
 
-    fn handle_serial(&mut self, message: Result<String>){
-
+    fn handle_serial(&mut self, message: Result<String>) {
+        match message {
+            Ok(s) => {
+                for line in s.split_inclusive('\n') {
+                    self.term_state.text.last_mut().unwrap().push_str(line);
+                    if line.ends_with('\n') {
+                        self.term_state.text.push("".into());
+                    }
+                }
+            }
+            Err(_) => todo!(),
+        }
     }
 }

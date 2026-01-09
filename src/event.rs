@@ -1,31 +1,36 @@
-use std::sync::Arc;
+use std::time::Duration;
 
 use color_eyre::{
     eyre::{self, OptionExt},
     Report, Result,
 };
-use eyre::{eyre, Error};
-use futures::{FutureExt, StreamExt};
+use eyre::eyre;
+use futures::{future::OptionFuture, FutureExt, StreamExt};
 use ratatui::crossterm::event::Event as CrosstermEvent;
 use serialport::SerialPort;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt, ReadBuf},
     select,
     sync::mpsc,
 };
 use tokio_serial::SerialStream;
+
+use tokio::time::sleep as tokio_sleep;
 
 #[derive(Debug)]
 pub enum ToAppMsg {
     Crossterm(CrosstermEvent),
     App(AppEvent),
     RecieveSerial(Result<String>),
+    SerialConnected(String),
+    SerialGone,
 }
 
 #[derive(Debug)]
 pub enum FromAppMsg {
     ConnectDevice(SerialStream),
     WriteSerial(ToSerialData),
+    DisconnectSerial,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +51,8 @@ pub struct EventHandler {
     from_mgr: mpsc::UnboundedReceiver<ToAppMsg>,
     to_mgr: mpsc::UnboundedSender<FromAppMsg>,
 }
+
+const FPS: f64 = 30.0;
 
 impl EventHandler {
     pub fn new() -> Self {
@@ -72,7 +79,7 @@ impl EventHandler {
     }
 
     pub fn send(&mut self, message: FromAppMsg) {
-        self.to_mgr.send(message);
+        let _ = self.to_mgr.send(message);
     }
 }
 
@@ -101,42 +108,71 @@ impl ManagerTask {
     }
 
     async fn run(mut self) -> Result<()> {
-        use FromAppMsg::{ConnectDevice, WriteSerial};
+        use FromAppMsg::{ConnectDevice, DisconnectSerial, WriteSerial};
         let mut reader = crossterm::event::EventStream::new();
+        // this is kinda stupid but is necessary to get rust to shut up
+        let mut reset_serial = false;
+        let mut new_serial: Option<SerialStream> = None;
         loop {
+            let no_device = eyre!("No device connected!");
+            if reset_serial {
+                self.serial = None;
+                let _ = self.to_app.send(ToAppMsg::SerialGone);
+                reset_serial = false;
+            }
+            if let Some(se) = new_serial.take() {
+                let _ = self.to_app.send(ToAppMsg::SerialConnected(
+                    se.name().unwrap_or("Virtual".into()),
+                ));
+                self.serial = Some(SerialHandler::new(se));
+            }
+            let (se_tx, se_rx) = self
+                .serial
+                .as_mut()
+                .map(
+                    |SerialHandler {
+                         app_tx: tx,
+                         app_rx: rx,
+                     }| (tx, rx),
+                )
+                .unzip();
+
+            let serial_read: OptionFuture<_> = se_rx.map(|rx| rx.recv()).into();
             let crossterm_event = reader.next().fuse();
             tokio::select! {
               _ = self.to_app.closed() => {
                 break;
               }
               Some(Ok(evt)) = crossterm_event => {
-                self.send(ToAppMsg::Crossterm(evt));
+                let _ = self.to_app.send(ToAppMsg::Crossterm(evt));
               }
               Some(e) = self.from_app.recv() => {
-            match e {
+               match e {
+                DisconnectSerial => { reset_serial = true; }
                 WriteSerial(s) => {
-                    let Some(ref serial) = self.serial else {
-                        self.to_app
-                            .send(ToAppMsg::RecieveSerial(Err(eyre!("No device connected"))));
-                        continue;
-                    };
-                    serial.app_tx.send(s);
+                  if se_tx
+                     .ok_or(no_device)
+                     .and_then(|serial| serial.send(s).map_err(|e| e.into()))
+                     .map_err(|e| self.to_app.send(ToAppMsg::RecieveSerial(Err(e))))
+                     .is_err() { break; }
                 }
                 ConnectDevice(serial) => {
-                    self.serial = Some(SerialHandler::new(serial));
+                   new_serial = Some(serial);
                 }
-            }
+               }
+              },
+              r = serial_read => {
+                match r{
+                  // serial does not exist, which is normal
+                  None => { },
+                  // serial is disconnected, in which case we need to tell the app and clear the serial
+                  Some(None) => { let _ = self.to_app.send(ToAppMsg::SerialGone); reset_serial = true;  }
+                  Some(Some(data)) => {let _ = self.to_app.send(ToAppMsg::RecieveSerial(data));}
+                }
               }
-            else => { break; }
             };
         }
         Ok(())
-    }
-
-    fn send(&self, event: ToAppMsg) {
-        // Ignores the result because shutting down the app drops the receiver, which causes the send
-        // operation to fail. This is expected behavior and should not panic.
-        let _ = self.to_app.send(event);
     }
 }
 
@@ -157,18 +193,20 @@ impl SerialHandler {
                 // unfortunately, there's literally no better way to represent the problem
                 select! {
                    _ = data_tx.closed() => break,
-                        read = device.read(&mut buf) => { let len = match read {
+                  read = device.read(&mut buf) => { let len = match read {
                         Ok(l) => l,
                         Err(e) => {
-                            data_tx.send(Err(e.into()));
+                            let _ = data_tx.send(Err(e.into()));
                             break;
                         }
                     };
                     if len == 0 {
-                        data_tx.send(Err(eyre!("Out of bytes to read!")));
+                        let _ = data_tx.send(Err(eyre!("Out of bytes to read!")));
+                        break;
                     } else {
                         let v = Vec::from(&buf[0..len]);
-                        data_tx.send(String::from_utf8(v).map_err(|e| e.into()));
+                        // If we failed to send, either the client's dead or something weird has happened, so die early
+                        if data_tx.send(String::from_utf8(v).map_err(|e| e.into())).is_err() {break};
                     }
 
                     },
@@ -194,7 +232,7 @@ impl SerialHandler {
                         }
                         None => eyre!("Serial terminal closed!"),
                     };
-                    data_tx.send(Err(err));
+                    let _ =  data_tx.send(Err(err));
                     break;
                 }
                     }
@@ -206,4 +244,39 @@ impl SerialHandler {
             app_rx: data_rx,
         }
     }
+}
+
+pub fn pseudo_serial() -> SerialStream {
+    let (computer, device) = SerialStream::pair().unwrap();
+    tokio::spawn(async {
+        let mut periods = 0;
+        let (mut reader, mut writer) = tokio::io::split(device);
+        let mut buffer = [0; 129];
+        loop {
+            let write = writer
+                .write_all(format!("{} milliseconds has passed\n", periods * 200).as_bytes())
+                .await;
+            if write.is_err() {
+                break;
+            }
+            let read = reader.read(&mut buffer[0..128]);
+            select! {
+             Ok(bytes) = read=>{ {
+                if writer
+                    .write_all("Received the following: ".as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                buffer[bytes] = b'\n';
+                if writer.write_all(&buffer[0..bytes + 1]).await.is_err() {
+                    break;
+                };
+            }},
+            _ = tokio_sleep(Duration::from_millis(200)) => {} }
+            periods += 1;
+        }
+    });
+    computer
 }

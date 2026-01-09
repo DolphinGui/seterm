@@ -9,50 +9,50 @@ use ratatui::{
 
 use crate::app::{App, Status, TerminalStatus};
 
-fn render_input_block(input: &str, area: Rect, buf: &mut Buffer) {
+fn render_input_block(input: &str, area: Rect, frame: &mut Frame) {
     let paragraph = Paragraph::new(input)
         .block(Block::bordered())
         .left_aligned();
-    paragraph.render(area, buf);
+    frame.render_widget(paragraph, area);
 }
 
-fn render_status_block(stat: &Status, area: Rect, buf: &mut Buffer) {
+fn render_status_block(stat: &Status, area: Rect, frame: &mut Frame) {
+    let [stats, log] =
+        &*Layout::vertical([Constraint::Percentage(30), Constraint::Percentage(70)]).split(area)
+    else {
+        panic!("Status constraint failed!");
+    };
+
     const ON: &str = "●";
     const OFF: &str = "○";
     let cts = if stat.cts { ON } else { OFF };
     let dtr = if stat.dtr { ON } else { OFF };
 
-    let status = format!("CTS: {}\nDTR: {}\n", cts, dtr);
+    let status = format!("CTS: {}\nDTR: {}\nConnected: {}", cts, dtr, stat.device);
 
     let status_block = Paragraph::new(status).block(Block::bordered()).centered();
-    status_block.render(area, buf);
+    frame.render_widget(status_block, *stats);
 }
 
-fn render_terminal_block(input: &mut TerminalStatus, area: Rect, buf: &mut Buffer) {
-    let [text_area, scrollbar_area] =
-        &*Layout::horizontal([Constraint::Min(20), Constraint::Length(1)]).split(area)
-    else {
-        panic!("Terminal constraint failed");
-    };
-    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+fn render_terminal_block(input: &mut TerminalStatus, area: Rect, frame: &mut Frame) {
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight).thumb_symbol("#");
     input.scroll_state = input
         .scroll_state
         .content_length(input.text.len())
         .position(input.text.len() - input.scroll_index);
-
-    scrollbar.render(*scrollbar_area, buf, &mut input.scroll_state);
+    frame.render_stateful_widget(scrollbar, area, &mut input.scroll_state);
     let block = Block::bordered();
-    let text_area = block.inner(*text_area);
-    block.render(area, buf);
+    let text_area = block.inner(area);
+    frame.render_widget(block, area);
+    let buf = frame.buffer_mut();
     let lines = input
         .text
         .iter()
         .rev()
         .skip(input.scroll_index)
         .enumerate()
-        .take(text_area.height.into());
+        .take((text_area.height + 1).into());
     for (lineno, line) in lines {
-        let y = input.text.len() - lineno;
         let line = Line::raw(line);
         for (
             x,
@@ -62,7 +62,9 @@ fn render_terminal_block(input: &mut TerminalStatus, area: Rect, buf: &mut Buffe
             },
         ) in line.styled_graphemes(Style::default()).enumerate()
         {
-            let Some(cell) = buf.cell_mut((x as u16, y as u16)) else {
+            let x = (x as u16).saturating_add(text_area.x);
+            let y = text_area.height + text_area.y - (lineno as u16);
+            let Some(cell) = buf.cell_mut((x, y)) else {
                 break;
             };
             cell.set_style(s);
@@ -74,7 +76,6 @@ fn render_terminal_block(input: &mut TerminalStatus, area: Rect, buf: &mut Buffe
 pub fn render_ui(state: &mut App, frame: &mut Frame) {
     use ratatui::layout::Direction;
     let area = frame.area();
-    let buf = frame.buffer_mut();
     let a = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(70), Constraint::Min(20)])
@@ -93,7 +94,7 @@ pub fn render_ui(state: &mut App, frame: &mut Frame) {
         panic!("Layout should have 2 items only");
     };
 
-    render_input_block(&state.term_input, *input, buf);
-    render_status_block(&state.status, *status_area, buf);
-    render_terminal_block(&mut state.term_state, *term, buf);
+    render_input_block(&state.term_input, *input, frame);
+    render_status_block(&state.status, *status_area, frame);
+    render_terminal_block(&mut state.term_state, *term, frame);
 }
