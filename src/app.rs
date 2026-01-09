@@ -1,3 +1,5 @@
+use std::mem::take;
+
 use crate::{
     event::{pseudo_serial, AppEvent, EventHandler, FromAppMsg, ToAppMsg},
     ui::render_ui,
@@ -84,7 +86,7 @@ impl App {
     }
 
     pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
-        use KeyCode::{Char, Esc};
+        use KeyCode::{Char, Enter, Esc};
         match key_event.code {
             Esc => self.events.send_self(AppEvent::Quit),
             Char('c') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -105,6 +107,7 @@ impl App {
             Char(c) if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.term_input.push(c)
             }
+            Enter => self.enter_input(),
             _ => {}
         }
         Ok(())
@@ -122,5 +125,15 @@ impl App {
             }
             Err(_) => todo!(),
         }
+    }
+
+    fn enter_input(&mut self) {
+        if self.term_input.is_empty() {
+            return;
+        }
+        self.events
+            .send(FromAppMsg::WriteSerial(crate::event::ToSerialData::Data(
+                take(&mut self.term_input),
+            )));
     }
 }

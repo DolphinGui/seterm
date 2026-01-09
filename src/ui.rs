@@ -1,9 +1,8 @@
 use ratatui::{
-    buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     style::Style,
     text::{Line, StyledGrapheme},
-    widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, StatefulWidget, Widget},
+    widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation},
     Frame,
 };
 
@@ -17,7 +16,7 @@ fn render_input_block(input: &str, area: Rect, frame: &mut Frame) {
 }
 
 fn render_status_block(stat: &Status, area: Rect, frame: &mut Frame) {
-    let [stats, log] =
+    let [stats, _log] =
         &*Layout::vertical([Constraint::Percentage(30), Constraint::Percentage(70)]).split(area)
     else {
         panic!("Status constraint failed!");

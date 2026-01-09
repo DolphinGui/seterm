@@ -9,7 +9,7 @@ use futures::{future::OptionFuture, FutureExt, StreamExt};
 use ratatui::crossterm::event::Event as CrosstermEvent;
 use serialport::SerialPort;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, ReadBuf},
+    io::{AsyncReadExt, AsyncWriteExt},
     select,
     sync::mpsc,
 };
@@ -51,8 +51,6 @@ pub struct EventHandler {
     from_mgr: mpsc::UnboundedReceiver<ToAppMsg>,
     to_mgr: mpsc::UnboundedSender<FromAppMsg>,
 }
-
-const FPS: f64 = 30.0;
 
 impl EventHandler {
     pub fn new() -> Self {
