@@ -33,7 +33,7 @@ where
         ) in line.styled_graphemes(Style::default()).enumerate()
         {
             let x = (x as u16).saturating_add(area.x);
-            let y = area.y + (lineno as u16);
+            let y = area.height + area.y - (lineno as u16 + 1);
             let Some(cell) = buf.cell_mut((x, y)) else {
                 break;
             };

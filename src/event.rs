@@ -251,7 +251,7 @@ pub fn pseudo_serial() -> SerialStream {
         let mut buffer = [0; 128];
         loop {
             let write = writer
-                .write_all(format!("{} seconds has passed\n", periods ).as_bytes())
+                .write_all(format!("{} seconds has passed\n", periods).as_bytes())
                 .await;
             if write.is_err() {
                 break;
