@@ -722,6 +722,7 @@ version = "0.1.0"
 dependencies = [
  "color-eyre",
  "crossterm",
+ "eyre",
  "futures",
  "ratatui",
  "serialport",

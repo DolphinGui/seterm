@@ -1,5 +1,5 @@
 use crate::{
-    event::{AppEvent, Event, EventHandler},
+    event::{AppEvent, EventHandler, ToAppMsg},
     ui::render_ui,
 };
 use ratatui::{
@@ -7,6 +7,8 @@ use ratatui::{
     widgets::ScrollbarState,
     DefaultTerminal,
 };
+
+use color_eyre::Result;
 
 #[derive(Debug)]
 pub struct Status {
@@ -35,6 +37,12 @@ pub struct App {
 
 impl Default for App {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl App {
+    pub fn new() -> Self {
         Self {
             running: true,
             counter: 0,
@@ -51,41 +59,32 @@ impl Default for App {
             },
         }
     }
-}
 
-impl App {
-    pub fn new() -> Self {
-        Self::default()
-    }
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
         use crossterm::event::{Event::Key, KeyEventKind::Press};
-        use Event::{App, Crossterm, Tick};
+        use ToAppMsg::{App, Crossterm};
         while self.running {
             terminal.draw(|frame| render_ui(&mut self, frame))?;
             match self.events.next().await? {
-                Tick => self.tick(),
                 Crossterm(Key(event)) => {
                     if event.kind == Press {
                         self.handle_key_events(event)?
                     }
                 }
                 Crossterm(_) => {}
-                App(app_event) => match app_event {
-                    AppEvent::Increment => self.increment_counter(),
-                    AppEvent::Decrement => self.decrement_counter(),
-                    AppEvent::Quit => self.quit(),
-                },
+                App(AppEvent::Quit) => self.running = false,
+                ToAppMsg::RecieveSerial(s) => self.handle_serial(s),
             }
         }
         Ok(())
     }
 
     pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
-        use KeyCode::{Char, Esc, Left, Right};
+        use KeyCode::{Char, Esc};
         match key_event.code {
-            Esc => self.events.send(AppEvent::Quit),
+            Esc => self.events.send_self(AppEvent::Quit),
             Char('c' | 'C') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.events.send(AppEvent::Quit)
+                self.events.send_self(AppEvent::Quit)
             }
             Char('d' | 'D') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.status.dtr = !self.status.dtr;
@@ -96,24 +95,12 @@ impl App {
             Char(c) if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.term_input.push(c)
             }
-            Right => self.events.send(AppEvent::Increment),
-            Left => self.events.send(AppEvent::Decrement),
             _ => {}
         }
         Ok(())
     }
 
-    pub fn tick(&self) {}
+    fn handle_serial(&mut self, message: Result<String>){
 
-    pub fn quit(&mut self) {
-        self.running = false;
-    }
-
-    pub fn increment_counter(&mut self) {
-        self.counter = self.counter.saturating_add(1);
-    }
-
-    pub fn decrement_counter(&mut self) {
-        self.counter = self.counter.saturating_sub(1);
     }
 }
