@@ -248,7 +248,7 @@ pub fn pseudo_serial() -> SerialStream {
     tokio::spawn(async {
         let mut periods = 0;
         let (mut reader, mut writer) = tokio::io::split(device);
-        let mut buffer = [0; 129];
+        let mut buffer = [0; 128];
         loop {
             let write = writer
                 .write_all(format!("{} milliseconds has passed\n", periods * 200).as_bytes())
@@ -256,7 +256,7 @@ pub fn pseudo_serial() -> SerialStream {
             if write.is_err() {
                 break;
             }
-            let read = reader.read(&mut buffer[0..128]);
+            let read = reader.read(&mut buffer);
             select! {
              Ok(bytes) = read=>{ {
                 if writer
@@ -266,8 +266,7 @@ pub fn pseudo_serial() -> SerialStream {
                 {
                     break;
                 }
-                buffer[bytes] = b'\n';
-                if writer.write_all(&buffer[0..bytes + 1]).await.is_err() {
+                if writer.write_all(&buffer[0..bytes]).await.is_err() {
                     break;
                 };
             }},
