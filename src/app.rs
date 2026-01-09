@@ -1,13 +1,15 @@
 use std::mem::take;
 
 use crate::{
+    device_finder::{DeviceFinder, Reactive},
     event::{AppEvent, EventHandler, FromAppMsg, ToAppMsg, ToSerialData, pseudo_serial},
     ui::render_ui,
 };
+
 use ratatui::{
-    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
-    widgets::ScrollbarState,
     DefaultTerminal,
+    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+    widgets::{ScrollbarState, Widget},
 };
 
 use color_eyre::{Report, Result};
@@ -29,7 +31,6 @@ pub struct TerminalStatus {
     pub scroll_state: ScrollbarState,
 }
 
-#[derive(Debug)]
 pub struct App {
     pub running: bool,
     pub counter: u8,
@@ -37,6 +38,7 @@ pub struct App {
     pub term_input: String,
     pub term_state: TerminalStatus,
     pub status: Status,
+    pub popup: Option<Box<dyn Reactive>>,
 }
 
 impl Default for App {
@@ -63,12 +65,13 @@ impl App {
                 device: "None".into(),
                 log: vec![],
             },
+            popup: None,
         }
     }
 
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
+        use ToAppMsg::{App, Crossterm, RecieveSerial, SerialConnected, SerialGone};
         use crossterm::event::{Event::Key, KeyEventKind::Press};
-        use ToAppMsg::{App, Crossterm};
         while self.running {
             terminal.draw(|frame| render_ui(&mut self, frame))?;
             match self.events.next().await? {
@@ -79,9 +82,13 @@ impl App {
                 }
                 Crossterm(_) => {}
                 App(AppEvent::Quit) => self.running = false,
-                ToAppMsg::RecieveSerial(s) => self.handle_serial(s),
-                ToAppMsg::SerialGone => self.status.device = "None".into(),
-                ToAppMsg::SerialConnected(s) => self.status.device = s,
+                RecieveSerial(s) => self.handle_serial(s),
+                SerialGone => self.status.device = "None".into(),
+                SerialConnected(s) => self.status.device = s,
+                App(AppEvent::SelectDevice(_)) => {
+                    todo!()
+                }
+                App(AppEvent::RequestAvailableDevices) => todo!(),
             }
         }
         Ok(())
@@ -89,22 +96,36 @@ impl App {
 
     pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
         use KeyCode::{Char, Enter, Esc};
+        if let Some(popup) = self.popup.as_mut()
+            && let Some(e) = popup.listen(crossterm::event::Event::Key(key_event))
+        {
+            self.events.send_self(e);
+        };
         match key_event.code {
-            Esc => self.events.send_self(AppEvent::Quit),
+            Esc => {
+                if self.popup.is_some() {
+                    self.popup = None;
+                } else {
+                    self.events.send_self(AppEvent::Quit)
+                }
+            }
             Char('c') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.events.send_self(AppEvent::Quit)
             }
             Char('s') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.events.send(FromAppMsg::ConnectDevice(pseudo_serial()));
             }
-            Char('x') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+            Char('d') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.events.send(FromAppMsg::DisconnectSerial);
             }
-            Char('d' | 'D') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+            Char('r') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.status.dtr = !self.status.dtr;
             }
-            Char('f' | 'F') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+            Char('t') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.status.cts = !self.status.cts;
+            }
+            Char('f') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.find_devices();
             }
             Char(c) if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.term_input.push(c)
@@ -133,12 +154,38 @@ impl App {
     fn enter_input(&mut self) {
         self.term_input.push('\n');
         self.events
-            .send(FromAppMsg::WriteSerial(ToSerialData::Data(
-                take(&mut self.term_input),
-            )));
+            .send(FromAppMsg::WriteSerial(ToSerialData::Data(take(
+                &mut self.term_input,
+            ))));
     }
 
     fn log_err(&mut self, report: Report) {
         self.status.log.push(report.to_string());
+    }
+
+    fn log_err_str(&mut self, report: &str) {
+        self.status.log.push(report.into());
+    }
+
+    fn find_devices(&mut self) {
+        if self.popup.is_some() {
+            return;
+        }
+        let devices = tokio_serial::available_ports();
+        let devices: Vec<_> = match devices {
+            Ok(d) => d,
+            Err(e) => {
+                self.log_err(e.into());
+                return;
+            }
+        }
+        .into_iter()
+        .map(|s| s.port_name)
+        .collect();
+        if devices.is_empty() {
+            self.log_err_str("No devices found");
+        } else {
+            self.popup = Some(Box::new(DeviceFinder::new(devices)));
+        }
     }
 }

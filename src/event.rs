@@ -35,6 +35,8 @@ pub enum FromAppMsg {
 
 #[derive(Clone, Debug)]
 pub enum AppEvent {
+    RequestAvailableDevices,
+    SelectDevice(String),
     Quit,
 }
 

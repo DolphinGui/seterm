@@ -1,12 +1,15 @@
 use ratatui::{
+    Frame,
     layout::{Constraint, Layout, Rect},
     style::Style,
     text::{Line, StyledGrapheme},
     widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation},
-    Frame,
 };
 
-use crate::app::{App, Status, TerminalStatus};
+use crate::{
+    app::{App, Status, TerminalStatus},
+    device_finder::Reactive,
+};
 
 fn render_input_block(input: &str, area: Rect, frame: &mut Frame) {
     let paragraph = Paragraph::new(input)
@@ -81,6 +84,18 @@ fn render_terminal_block(input: &mut TerminalStatus, area: Rect, frame: &mut Fra
     render_log(lines, text_area, frame);
 }
 
+fn render_popup(popup: &mut dyn Reactive, area: Rect, frame: &mut Frame) {
+    let x_margin = area.width / 4;
+    let y_margin = area.height / 4;
+    let area = area.inner(ratatui::layout::Margin {
+        horizontal: x_margin,
+        vertical: y_margin,
+    });
+
+    let buf = frame.buffer_mut();
+    popup.draw(area, buf);
+}
+
 pub fn render_ui(state: &mut App, frame: &mut Frame) {
     use ratatui::layout::Direction;
     let area = frame.area();
@@ -105,4 +120,7 @@ pub fn render_ui(state: &mut App, frame: &mut Frame) {
     render_terminal_block(&mut state.term_state, *term, frame);
     render_input_block(&state.term_input, *input, frame);
     render_status_block(&state.status, *status_area, frame);
+    if let Some(popup) = state.popup.as_mut() {
+        render_popup(popup.as_mut(), area, frame);
+    }
 }
