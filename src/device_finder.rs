@@ -2,6 +2,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
+    style::{Color, Style},
     text::Text,
     widgets::{Block, List, ListState, StatefulWidget, Widget},
 };
@@ -57,7 +58,10 @@ impl EventListener for DeviceFinder {
 impl Drawable for DeviceFinder {
     fn draw(&mut self, area: Rect, buf: &mut Buffer) {
         let text: Vec<_> = self.devices.iter().map(Text::raw).collect();
-        let l = List::new(text).block(Block::bordered());
+        let highlight_style = Style::default().fg(Color::Black).bg(Color::White);
+        let l = List::new(text)
+            .block(Block::bordered())
+            .highlight_style(highlight_style);
         <List as StatefulWidget>::render(l, area, buf, &mut self.state);
     }
 }
