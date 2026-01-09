@@ -1,7 +1,7 @@
 use std::mem::take;
 
 use crate::{
-    event::{pseudo_serial, AppEvent, EventHandler, FromAppMsg, ToAppMsg},
+    event::{AppEvent, EventHandler, FromAppMsg, ToAppMsg, ToSerialData, pseudo_serial},
     ui::render_ui,
 };
 use ratatui::{
@@ -131,11 +131,9 @@ impl App {
     }
 
     fn enter_input(&mut self) {
-        if self.term_input.is_empty() {
-            return;
-        }
+        self.term_input.push('\n');
         self.events
-            .send(FromAppMsg::WriteSerial(crate::event::ToSerialData::Data(
+            .send(FromAppMsg::WriteSerial(ToSerialData::Data(
                 take(&mut self.term_input),
             )));
     }
