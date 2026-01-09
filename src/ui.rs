@@ -15,8 +15,36 @@ fn render_input_block(input: &str, area: Rect, frame: &mut Frame) {
     frame.render_widget(paragraph, area);
 }
 
+fn render_log<'a, T: Iterator>(lines: T, area: Rect, frame: &mut Frame)
+where
+    std::borrow::Cow<'a, str>: std::convert::From<<T as std::iter::Iterator>::Item>,
+    <T as std::iter::Iterator>::Item: std::fmt::Display,
+{
+    let lines = lines.enumerate().take((area.height).into());
+    let buf = frame.buffer_mut();
+    for (lineno, line) in lines {
+        let line = Line::raw(line);
+        for (
+            x,
+            StyledGrapheme {
+                style: s,
+                symbol: g,
+            },
+        ) in line.styled_graphemes(Style::default()).enumerate()
+        {
+            let x = (x as u16).saturating_add(area.x);
+            let y = area.y + (lineno as u16);
+            let Some(cell) = buf.cell_mut((x, y)) else {
+                break;
+            };
+            cell.set_style(s);
+            cell.set_symbol(g);
+        }
+    }
+}
+
 fn render_status_block(stat: &Status, area: Rect, frame: &mut Frame) {
-    let [stats, _log] =
+    let [stats, log_area] =
         &*Layout::vertical([Constraint::Percentage(30), Constraint::Percentage(70)]).split(area)
     else {
         panic!("Status constraint failed!");
@@ -27,7 +55,13 @@ fn render_status_block(stat: &Status, area: Rect, frame: &mut Frame) {
     let cts = if stat.cts { ON } else { OFF };
     let dtr = if stat.dtr { ON } else { OFF };
 
-    let status = format!("CTS: {}\nDTR: {}\nConnected: {}", cts, dtr, stat.device);
+    let log_block = Block::bordered();
+    let log_zone = log_block.inner(*log_area);
+    frame.render_widget(log_block, *log_area);
+    let lines = stat.log.iter().rev();
+    render_log(lines, log_zone, frame);
+
+    let status = format!("CTS: {}\nDTR: {}\nConnected: {}", cts, dtr, stat.device,);
 
     let status_block = Paragraph::new(status).block(Block::bordered()).centered();
     frame.render_widget(status_block, *stats);
@@ -43,33 +77,8 @@ fn render_terminal_block(input: &mut TerminalStatus, area: Rect, frame: &mut Fra
     let block = Block::bordered();
     let text_area = block.inner(area);
     frame.render_widget(block, area);
-    let buf = frame.buffer_mut();
-    let lines = input
-        .text
-        .iter()
-        .rev()
-        .skip(input.scroll_index)
-        .enumerate()
-        .take((text_area.height + 1).into());
-    for (lineno, line) in lines {
-        let line = Line::raw(line);
-        for (
-            x,
-            StyledGrapheme {
-                style: s,
-                symbol: g,
-            },
-        ) in line.styled_graphemes(Style::default()).enumerate()
-        {
-            let x = (x as u16).saturating_add(text_area.x);
-            let y = text_area.height + text_area.y - (lineno as u16);
-            let Some(cell) = buf.cell_mut((x, y)) else {
-                break;
-            };
-            cell.set_style(s);
-            cell.set_symbol(g);
-        }
-    }
+    let lines = input.text.iter().rev().skip(input.scroll_index);
+    render_log(lines, text_area, frame);
 }
 
 pub fn render_ui(state: &mut App, frame: &mut Frame) {
@@ -93,7 +102,7 @@ pub fn render_ui(state: &mut App, frame: &mut Frame) {
         panic!("Layout should have 2 items only");
     };
 
+    render_terminal_block(&mut state.term_state, *term, frame);
     render_input_block(&state.term_input, *input, frame);
     render_status_block(&state.status, *status_area, frame);
-    render_terminal_block(&mut state.term_state, *term, frame);
 }

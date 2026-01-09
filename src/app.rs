@@ -10,13 +10,14 @@ use ratatui::{
     DefaultTerminal,
 };
 
-use color_eyre::Result;
+use color_eyre::{Report, Result};
 
 #[derive(Debug)]
 pub struct Status {
     pub cts: bool,
     pub dtr: bool,
     pub device: String,
+    pub log: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -60,6 +61,7 @@ impl App {
                 cts: false,
                 dtr: false,
                 device: "None".into(),
+                log: vec![],
             },
         }
     }
@@ -117,13 +119,14 @@ impl App {
         match message {
             Ok(s) => {
                 for line in s.split_inclusive('\n') {
-                    self.term_state.text.last_mut().unwrap().push_str(line);
-                    if line.ends_with('\n') {
-                        self.term_state.text.push("".into());
+                    if self.term_state.text.last().unwrap().ends_with('\n') {
+                        self.term_state.text.push(line.into());
+                    } else {
+                        self.term_state.text.last_mut().unwrap().push_str(line);
                     }
                 }
             }
-            Err(_) => todo!(),
+            Err(e) => self.log_err(e),
         }
     }
 
@@ -135,5 +138,9 @@ impl App {
             .send(FromAppMsg::WriteSerial(crate::event::ToSerialData::Data(
                 take(&mut self.term_input),
             )));
+    }
+
+    fn log_err(&mut self, report: Report) {
+        self.status.log.push(report.to_string());
     }
 }

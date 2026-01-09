@@ -148,11 +148,10 @@ impl ManagerTask {
                match e {
                 DisconnectSerial => { reset_serial = true; }
                 WriteSerial(s) => {
-                  if se_tx
+                   let _ = se_tx
                      .ok_or(no_device)
                      .and_then(|serial| serial.send(s).map_err(|e| e.into()))
-                     .map_err(|e| self.to_app.send(ToAppMsg::RecieveSerial(Err(e))))
-                     .is_err() { break; }
+                     .map_err(|e| self.to_app.send(ToAppMsg::RecieveSerial(Err(e))));
                 }
                 ConnectDevice(serial) => {
                    new_serial = Some(serial);
