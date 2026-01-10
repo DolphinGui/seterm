@@ -21,17 +21,16 @@ use tokio::time::sleep as tokio_sleep;
 pub enum ToAppMsg {
     Crossterm(CrosstermEvent),
     App(AppEvent),
-    RecieveSerial(Result<String>),
+    RecieveSerial(Result<FromSerialData>),
     SerialConnected(String),
     SerialGone,
-    DebugMessage(String),
+    Log(String),
 }
 
 #[derive(Debug)]
 pub enum FromAppMsg {
     ConnectDevice(SerialStream),
     WriteSerial(ToSerialData),
-    DisconnectSerial,
 }
 
 #[derive(Debug)]
@@ -46,8 +45,15 @@ pub enum AppEvent {
 #[derive(Clone, Debug)]
 pub enum ToSerialData {
     Data(String),
-    RTS(bool),
+    CTS(bool),
     DTR(bool),
+    Disconnect,
+    RequestStatus,
+}
+#[derive(Clone, Debug)]
+pub enum FromSerialData {
+    Data(Vec<u8>),
+    Status { dtr: bool, cts: bool },
 }
 
 #[derive(Debug)]
@@ -111,7 +117,7 @@ impl ManagerTask {
     }
 
     async fn run(mut self) -> Result<()> {
-        use FromAppMsg::{ConnectDevice, DisconnectSerial, WriteSerial};
+        use FromAppMsg::{ConnectDevice, WriteSerial};
         let mut reader = crossterm::event::EventStream::new();
         // this is kinda stupid but is necessary to get rust to shut up
         let mut reset_serial = false;
@@ -151,7 +157,6 @@ impl ManagerTask {
               }
               Some(e) = self.from_app.recv() => {
                match e {
-                DisconnectSerial => { reset_serial = true; }
                 WriteSerial(s) => {
                    let _ = se_tx
                      .ok_or(no_device)
@@ -180,17 +185,18 @@ impl ManagerTask {
 
 struct SerialHandler {
     app_tx: mpsc::UnboundedSender<ToSerialData>,
-    app_rx: mpsc::UnboundedReceiver<Result<String>>,
+    app_rx: mpsc::UnboundedReceiver<Result<FromSerialData>>,
 }
 
 impl SerialHandler {
     fn new(mut device: SerialStream) -> Self {
-        use ToSerialData::{DTR, Data, RTS};
+        use ToSerialData::{CTS, DTR, Data, Disconnect, RequestStatus};
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let (data_tx, data_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             let mut buf = [0; 128];
-            loop {
+            let mut alive = true;
+            while alive {
                 // I hate the formatting, and macros are atrocious
                 // unfortunately, there's literally no better way to represent the problem
                 select! {
@@ -206,9 +212,8 @@ impl SerialHandler {
                         let _ = data_tx.send(Err(eyre!("Out of bytes to read!")));
                         break;
                     } else {
-                        let v = Vec::from(&buf[0..len]);
                         // If we failed to send, either the client's dead or something weird has happened, so die early
-                        if data_tx.send(String::from_utf8(v).map_err(|e| e.into())).is_err() {break};
+                        if data_tx.send(Ok(FromSerialData::Data(Vec::from(&buf[0..len])))).is_err() {break};
                     }
 
                     },
@@ -226,11 +231,31 @@ impl SerialHandler {
                             };
                             e.into()
                         }
-                        Some(RTS(b)) => {
+                        Some(CTS(b)) => {
                             let Err(e) = device.write_request_to_send(b) else {
                                 continue;
                             };
                             e.into()
+                        }
+                        Some(Disconnect) =>{
+                            alive = false; continue;
+                        }
+                        Some(RequestStatus) =>{
+                            let dtr = match device.read_data_set_ready(){
+                                Ok(d) => d,
+                                Err(e) => { _ = data_tx.send(Err(e.into())); true }
+                            };
+                            let cts = match device.read_clear_to_send(){
+                                Ok(d) => d,
+                                Err(e) => { _ = data_tx.send(Err(e.into())); true }
+                            };
+                              
+                            if data_tx.send(
+                              Ok(
+                                FromSerialData::Status{ dtr, cts }
+                              )
+                            ).is_err() {break};
+                            continue;
                         }
                         None => eyre!("Serial terminal closed!"),
                     };

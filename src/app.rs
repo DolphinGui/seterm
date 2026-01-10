@@ -2,7 +2,9 @@ use std::mem::take;
 
 use crate::{
     device_finder::{DeviceConfigurer, DeviceFinder, Reactive},
-    event::{AppEvent, EventHandler, FromAppMsg, ToAppMsg, ToSerialData, pseudo_serial},
+    event::{
+        AppEvent, EventHandler, FromAppMsg, FromSerialData, ToAppMsg, ToSerialData, pseudo_serial,
+    },
     ui::render_ui,
 };
 
@@ -71,7 +73,7 @@ impl App {
     }
 
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
-        use ToAppMsg::{App, Crossterm, DebugMessage, RecieveSerial, SerialConnected, SerialGone};
+        use ToAppMsg::{App, Crossterm, Log, RecieveSerial, SerialConnected, SerialGone};
         use crossterm::event::{Event::Key, KeyEventKind::Press};
         while self.running {
             terminal.draw(|frame| render_ui(&mut self, frame))?;
@@ -92,10 +94,13 @@ impl App {
                         self.events.to_self.clone(),
                     )))
                 }
-                App(AppEvent::ConnectDevice(d)) => self.events.send(FromAppMsg::ConnectDevice(d)),
+                App(AppEvent::ConnectDevice(d)) => {
+                    self.events.send(FromAppMsg::ConnectDevice(d));
+                    self.popup = None;
+                }
                 App(AppEvent::RequestAvailableDevices) => todo!(),
                 App(AppEvent::Leave) => self.popup = None,
-                DebugMessage(m) => self.log_err_str(&m),
+                Log(m) => self.log_err_str(&m),
             }
         }
         Ok(())
@@ -123,13 +128,18 @@ impl App {
                 self.events.send(FromAppMsg::ConnectDevice(pseudo_serial()));
             }
             Char('d') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.events.send(FromAppMsg::DisconnectSerial);
+                self.events
+                    .send(FromAppMsg::WriteSerial(ToSerialData::Disconnect));
             }
             Char('r') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.status.dtr = !self.status.dtr;
+                self.events
+                    .send(FromAppMsg::WriteSerial(ToSerialData::DTR(self.status.dtr)));
             }
             Char('t') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.status.cts = !self.status.cts;
+                self.events
+                    .send(FromAppMsg::WriteSerial(ToSerialData::CTS(self.status.cts)));
             }
             Char('f') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.find_devices();
@@ -143,16 +153,21 @@ impl App {
         Ok(())
     }
 
-    fn handle_serial(&mut self, message: Result<String>) {
+    fn handle_serial(&mut self, message: Result<FromSerialData>) {
+        use FromSerialData::{Data, Status};
         match message {
-            Ok(s) => {
-                for line in s.split_inclusive('\n') {
+            Ok(Data(s)) => {
+                for line in String::from_utf8_lossy(&s).split_inclusive('\n') {
                     if self.term_state.text.last().unwrap().ends_with('\n') {
                         self.term_state.text.push(line.into());
                     } else {
                         self.term_state.text.last_mut().unwrap().push_str(line);
                     }
                 }
+            }
+            Ok(Status { dtr, cts }) => {
+                self.status.dtr = dtr;
+                self.status.cts = cts;
             }
             Err(e) => self.log_err(e),
         }

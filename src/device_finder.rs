@@ -10,6 +10,7 @@ use ratatui::{
 };
 use serialport::{DataBits, FlowControl, Parity, SerialPortInfo, StopBits};
 use tokio::sync::mpsc;
+use tokio_serial::SerialPortBuilderExt;
 
 use crate::event::{AppEvent, ToAppMsg};
 
@@ -235,7 +236,18 @@ impl EventListener for DeviceConfigurer {
             Key(KeyEvent { code: Down, .. }) => self.table_state.scroll_down_by(1),
             Key(KeyEvent { code: Left, .. }) => self.select(-1),
             Key(KeyEvent { code: Right, .. }) => self.select(1),
-            Key(KeyEvent { code: Enter, .. }) => todo!(),
+            Key(KeyEvent { code: Enter, .. }) => {
+                let config = tokio_serial::new(self.path.clone(), self.baud as u32)
+                    .data_bits(self.bits)
+                    .flow_control(self.flow)
+                    .parity(self.parity)
+                    .stop_bits(self.stop)
+                    .dtr_on_open(self.dtr);
+                match config.open_native_async() {
+                    Ok(s) => self.to_app.send(ToAppMsg::App(AppEvent::ConnectDevice(s))),
+                    Err(e) => self.to_app.send(ToAppMsg::Log(e.description)),
+                };
+            }
             _ => handled = false,
         };
         handled
