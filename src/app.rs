@@ -1,7 +1,7 @@
 use std::mem::take;
 
 use crate::{
-    device_finder::{DeviceFinder, Reactive},
+    device_finder::{DeviceConfigurer, DeviceFinder, Reactive},
     event::{AppEvent, EventHandler, FromAppMsg, ToAppMsg, ToSerialData, pseudo_serial},
     ui::render_ui,
 };
@@ -71,7 +71,7 @@ impl App {
     }
 
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
-        use ToAppMsg::{App, Crossterm, RecieveSerial, SerialConnected, SerialGone};
+        use ToAppMsg::{App, Crossterm, DebugMessage, RecieveSerial, SerialConnected, SerialGone};
         use crossterm::event::{Event::Key, KeyEventKind::Press};
         while self.running {
             terminal.draw(|frame| render_ui(&mut self, frame))?;
@@ -87,10 +87,15 @@ impl App {
                 SerialGone => self.status.device = "None".into(),
                 SerialConnected(s) => self.status.device = s,
                 App(AppEvent::SelectDevice(s)) => {
-                    todo!();
+                    self.popup = Some(Box::new(DeviceConfigurer::new(
+                        s,
+                        self.events.to_self.clone(),
+                    )))
                 }
+                App(AppEvent::ConnectDevice(d)) => self.events.send(FromAppMsg::ConnectDevice(d)),
                 App(AppEvent::RequestAvailableDevices) => todo!(),
                 App(AppEvent::Leave) => self.popup = None,
+                DebugMessage(m) => self.log_err_str(&m),
             }
         }
         Ok(())
@@ -98,8 +103,10 @@ impl App {
 
     pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
         use KeyCode::{Char, Enter, Esc};
-        if let Some(popup) = self.popup.as_mut() {
-            popup.listen(crossterm::event::Event::Key(key_event));
+        if let Some(popup) = self.popup.as_mut()
+            && popup.listen(crossterm::event::Event::Key(key_event))
+        {
+            return Ok(());
         };
         match key_event.code {
             Esc => {
@@ -189,7 +196,10 @@ impl App {
         if devices.is_empty() {
             self.log_err_str("No devices found");
         } else {
-            self.popup = Some(Box::new(DeviceFinder::new(devices, self.events.to_self.clone())));
+            self.popup = Some(Box::new(DeviceFinder::new(
+                devices,
+                self.events.to_self.clone(),
+            )));
         }
     }
 }

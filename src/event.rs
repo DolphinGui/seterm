@@ -24,6 +24,7 @@ pub enum ToAppMsg {
     RecieveSerial(Result<String>),
     SerialConnected(String),
     SerialGone,
+    DebugMessage(String),
 }
 
 #[derive(Debug)]
@@ -33,10 +34,11 @@ pub enum FromAppMsg {
     DisconnectSerial,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum AppEvent {
     RequestAvailableDevices,
     SelectDevice(String),
+    ConnectDevice(SerialStream),
     Leave,
     Quit,
 }
