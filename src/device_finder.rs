@@ -1,10 +1,9 @@
-use std::fmt::Display;
 
 use crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Style, Stylize},
+    style::{Style, Stylize},
     text::Text,
     widgets::{
         Block, Borders, List, ListState, Paragraph, Row, StatefulWidget, Table, TableState, Widget,
@@ -246,8 +245,8 @@ impl EventListener for DeviceConfigurer {
                     .stop_bits(self.stop)
                     .dtr_on_open(self.dtr);
                 match config.open_native_async() {
-                    Ok(s) => self.to_app.send(ToAppMsg::App(AppEvent::ConnectDevice(s))),
-                    Err(e) => self.to_app.send(ToAppMsg::Log(e.description)),
+                    Ok(s) => _ = self.to_app.send(ToAppMsg::App(AppEvent::ConnectDevice(s))),
+                    Err(e) => _ = self.to_app.send(ToAppMsg::Log(e.description)),
                 };
             }
             _ => handled = false,

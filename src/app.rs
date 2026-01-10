@@ -11,11 +11,10 @@ use crate::{
 use ratatui::{
     DefaultTerminal,
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
-    widgets::{ScrollbarState, Widget},
+    widgets::ScrollbarState,
 };
 
 use color_eyre::{Report, Result};
-use tokio_serial::SerialStream;
 
 #[derive(Debug)]
 pub struct Status {
@@ -99,7 +98,13 @@ impl App {
                     self.popup = None;
                 }
                 App(AppEvent::RequestAvailableDevices) => todo!(),
-                App(AppEvent::Leave) => self.popup = None,
+                App(AppEvent::Leave) => {
+                    if self.popup.is_some() {
+                        self.popup = None
+                    } else {
+                        self.running = false
+                    }
+                }
                 Log(m) => self.log_err_str(&m),
             }
         }
@@ -114,13 +119,7 @@ impl App {
             return Ok(());
         };
         match key_event.code {
-            Esc => {
-                if self.popup.is_some() {
-                    self.popup = None;
-                } else {
-                    self.events.send_self(AppEvent::Quit)
-                }
-            }
+            Esc => self.events.send_self(AppEvent::Leave),
             Char('c') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.events.send_self(AppEvent::Quit)
             }
