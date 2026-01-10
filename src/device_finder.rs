@@ -3,10 +3,12 @@ use std::fmt::Display;
 use crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::{
     buffer::Buffer,
-    layout::{Constraint, Rect},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Style, Stylize},
     text::Text,
-    widgets::{Block, List, ListState, Row, StatefulWidget, Table, TableState},
+    widgets::{
+        Block, Borders, List, ListState, Paragraph, Row, StatefulWidget, Table, TableState, Widget,
+    },
 };
 use serialport::{DataBits, FlowControl, Parity, SerialPortInfo, StopBits};
 use tokio::sync::mpsc;
@@ -256,6 +258,13 @@ impl EventListener for DeviceConfigurer {
 
 impl Drawable for DeviceConfigurer {
     fn draw(&mut self, area: Rect, buf: &mut Buffer) {
+        let [opt_area, desc_area] =
+            &*Layout::vertical([Constraint::Percentage(80), Constraint::Percentage(20)])
+                .split(area)
+        else {
+            panic!("Device configurer failed to configure");
+        };
+
         let bauds = format!("{}", self.baud as usize);
         let dtr = format!("{}", self.dtr);
         let rows = [
@@ -290,9 +299,16 @@ impl Drawable for DeviceConfigurer {
         ];
         let widths = [Constraint::Percentage(30), Constraint::Percentage(70)];
         let table = Table::new(rows, widths)
-            .block(Block::bordered())
+            .block(Block::new().borders(Borders::all().difference(Borders::BOTTOM)))
             .row_highlight_style(Style::new().reversed());
 
-        table.render(area, buf, &mut self.table_state);
+        <Table as StatefulWidget>::render(table, *opt_area, buf, &mut self.table_state);
+
+        let description = Paragraph::new(
+            "Left/Right to change option\nUp/Down to select option\nEnter to connect\nEsc to exit",
+        )
+        .block(Block::new().borders(Borders::all().difference(Borders::TOP)))
+        .centered();
+        description.render(*desc_area, buf);
     }
 }
