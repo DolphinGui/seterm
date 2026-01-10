@@ -90,6 +90,7 @@ impl App {
                     todo!();
                 }
                 App(AppEvent::RequestAvailableDevices) => todo!(),
+                App(AppEvent::Leave) => self.popup = None,
             }
         }
         Ok(())
@@ -97,10 +98,8 @@ impl App {
 
     pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
         use KeyCode::{Char, Enter, Esc};
-        if let Some(popup) = self.popup.as_mut()
-            && let Some(e) = popup.listen(crossterm::event::Event::Key(key_event))
-        {
-            self.events.send_self(e);
+        if let Some(popup) = self.popup.as_mut() {
+            popup.listen(crossterm::event::Event::Key(key_event));
         };
         match key_event.code {
             Esc => {
@@ -190,7 +189,7 @@ impl App {
         if devices.is_empty() {
             self.log_err_str("No devices found");
         } else {
-            self.popup = Some(Box::new(DeviceFinder::new(devices)));
+            self.popup = Some(Box::new(DeviceFinder::new(devices, self.events.to_self.clone())));
         }
     }
 }

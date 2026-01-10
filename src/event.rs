@@ -1,11 +1,11 @@
 use std::time::Duration;
 
 use color_eyre::{
-    eyre::{self, OptionExt},
     Report, Result,
+    eyre::{self, OptionExt},
 };
 use eyre::eyre;
-use futures::{future::OptionFuture, FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, future::OptionFuture};
 use ratatui::crossterm::event::Event as CrosstermEvent;
 use serialport::SerialPort;
 use tokio::{
@@ -37,6 +37,7 @@ pub enum FromAppMsg {
 pub enum AppEvent {
     RequestAvailableDevices,
     SelectDevice(String),
+    Leave,
     Quit,
 }
 
@@ -49,7 +50,7 @@ pub enum ToSerialData {
 
 #[derive(Debug)]
 pub struct EventHandler {
-    to_self: mpsc::UnboundedSender<ToAppMsg>,
+    pub to_self: mpsc::UnboundedSender<ToAppMsg>,
     from_mgr: mpsc::UnboundedReceiver<ToAppMsg>,
     to_mgr: mpsc::UnboundedSender<FromAppMsg>,
 }
@@ -182,7 +183,7 @@ struct SerialHandler {
 
 impl SerialHandler {
     fn new(mut device: SerialStream) -> Self {
-        use ToSerialData::{Data, DTR, RTS};
+        use ToSerialData::{DTR, Data, RTS};
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let (data_tx, data_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {

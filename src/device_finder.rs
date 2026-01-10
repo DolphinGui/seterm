@@ -4,16 +4,15 @@ use ratatui::{
     layout::Rect,
     style::{Color, Style},
     text::Text,
-    widgets::{Block, List, ListState, StatefulWidget, Widget},
+    widgets::{Block, List, ListState, StatefulWidget},
 };
-use serialport::{DataBits, FlowControl, Parity, SerialPortBuilder, SerialPortInfo, StopBits};
-use strum::IntoEnumIterator;
-use strum_macros::EnumIter;
+use serialport::{DataBits, FlowControl, Parity, SerialPortInfo, StopBits};
+use tokio::sync::mpsc;
 
-use crate::event::AppEvent;
+use crate::event::{AppEvent, ToAppMsg};
 
 pub trait EventListener {
-    fn listen(&mut self, e: Event) -> Option<AppEvent>;
+    fn listen(&mut self, e: Event);
 }
 
 pub trait Drawable {
@@ -27,6 +26,7 @@ impl<T> Reactive for T where T: EventListener + Drawable {}
 pub struct DeviceFinder {
     devices: Vec<SerialPortInfo>,
     state: ListState,
+    to_app: mpsc::UnboundedSender<ToAppMsg>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,31 +61,35 @@ pub struct DeviceConfigurer {
 }
 
 impl DeviceFinder {
-    pub fn new(devices: Vec<SerialPortInfo>) -> DeviceFinder {
+    pub fn new(
+        devices: Vec<SerialPortInfo>,
+        to_app: mpsc::UnboundedSender<ToAppMsg>,
+    ) -> DeviceFinder {
         Self {
             devices,
             state: ListState::default(),
+            to_app,
         }
     }
 }
 
 impl EventListener for DeviceFinder {
-    fn listen(&mut self, e: Event) -> Option<AppEvent> {
+    fn listen(&mut self, e: Event) {
         use Event::Key;
         use KeyCode::{Down, Enter, Up};
         match e {
             Key(KeyEvent { code: Up, .. }) => self.state.scroll_up_by(1),
             Key(KeyEvent { code: Down, .. }) => self.state.scroll_down_by(1),
             Key(KeyEvent { code: Enter, .. }) => {
-                return self
-                    .state
-                    .selected()
-                    .and_then(|i| self.devices.get(i))
-                    .map(|s| AppEvent::SelectDevice(s.port_name.clone()));
+                if let Some(d) = self.state.selected().and_then(|i| self.devices.get(i)) {
+                    _ = self
+                        .to_app
+                        .send(ToAppMsg::App(AppEvent::SelectDevice(d.port_name.clone())));
+                    _ = self.to_app.send(ToAppMsg::App(AppEvent::Leave));
+                };
             }
             _ => {}
         };
-        None
     }
 }
 
@@ -137,7 +141,7 @@ impl DeviceConfigurer {
 }
 
 impl EventListener for DeviceConfigurer {
-    fn listen(&mut self, e: Event) -> Option<AppEvent> {
+    fn listen(&mut self, e: Event) {
         use Event::Key;
         use KeyCode::{Down, Enter, Up};
         match e {
