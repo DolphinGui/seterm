@@ -13,6 +13,7 @@ use ratatui::{
 };
 
 use color_eyre::{Report, Result};
+use tokio_serial::SerialStream;
 
 #[derive(Debug)]
 pub struct Status {
@@ -85,8 +86,8 @@ impl App {
                 RecieveSerial(s) => self.handle_serial(s),
                 SerialGone => self.status.device = "None".into(),
                 SerialConnected(s) => self.status.device = s,
-                App(AppEvent::SelectDevice(_)) => {
-                    todo!()
+                App(AppEvent::SelectDevice(s)) => {
+                    todo!();
                 }
                 App(AppEvent::RequestAvailableDevices) => todo!(),
             }
@@ -168,6 +169,7 @@ impl App {
     }
 
     fn find_devices(&mut self) {
+        use serialport::SerialPortType::{BluetoothPort, PciPort, Unknown, UsbPort};
         if self.popup.is_some() {
             return;
         }
@@ -180,7 +182,10 @@ impl App {
             }
         }
         .into_iter()
-        .map(|s| s.port_name)
+        .filter(|e| match e.port_type {
+            UsbPort(_) | BluetoothPort => true,
+            PciPort | Unknown => false,
+        })
         .collect();
         if devices.is_empty() {
             self.log_err_str("No devices found");
