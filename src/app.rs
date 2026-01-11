@@ -5,6 +5,7 @@ use crate::{
     event::{
         AppEvent, EventHandler, FromAppMsg, FromSerialData, ToAppMsg, ToSerialData, pseudo_serial,
     },
+    fileviewer::{CmdInput, FileViewer},
     ui::render_ui,
 };
 
@@ -76,6 +77,7 @@ impl App {
         mut terminal: DefaultTerminal,
         default_baud: Baud,
         try_device: Option<String>,
+        default_cmd: String,
     ) -> color_eyre::Result<()> {
         use ToAppMsg::{App, Crossterm, Log, RecieveSerial, SerialConnected, SerialGone};
         use crossterm::event::{Event::Key, KeyEventKind::Press};
@@ -87,6 +89,7 @@ impl App {
                 .to_self
                 .send(App(AppEvent::SelectDevice(device)))?;
         }
+        let mut file: Option<_> = None;
         while self.running {
             terminal.draw(|frame| render_ui(&mut self, frame))?;
             match self.events.next().await? {
@@ -117,6 +120,16 @@ impl App {
                     } else {
                         self.running = false
                     }
+                }
+                App(AppEvent::UploadFile(f)) => {
+                    file = Some(f);
+                    self.popup = None;
+                    self.enter_cmd(default_cmd.clone());
+                }
+                App(AppEvent::UploadCmd(cmd)) => {
+                    self.popup = None;
+                    self.events
+                        .send(FromAppMsg::UploadFile(file.take().unwrap(), cmd));
                 }
                 Log(m) => self.log_err_str(m),
                 ToAppMsg::LogResult(exit_status, out, err) => {
@@ -159,6 +172,9 @@ impl App {
             }
             Char('f') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.find_devices();
+            }
+            Char('u') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.popup = Some(Box::new(FileViewer::new(self.events.to_self.clone())?));
             }
             Char(c) if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.term_input.push(c)
@@ -231,5 +247,15 @@ impl App {
                 self.events.to_self.clone(),
             )));
         }
+    }
+
+    fn enter_cmd(&mut self, default_cmd: String) {
+        if self.popup.is_some() {
+            return;
+        }
+        self.popup = Some(Box::new(CmdInput::new(
+            default_cmd,
+            self.events.to_self.clone(),
+        )));
     }
 }

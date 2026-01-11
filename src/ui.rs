@@ -1,8 +1,9 @@
+use color_eyre::owo_colors::OwoColorize;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::Style,
-    text::{Line, StyledGrapheme},
+    style::{Modifier, Style},
+    text::{Line, Span, StyledGrapheme, Text},
     widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation},
 };
 
@@ -12,7 +13,9 @@ use crate::{
 };
 
 fn render_input_block(input: &str, area: Rect, frame: &mut Frame) {
-    let paragraph = Paragraph::new(input)
+    let cursor = Span::raw("█").style(Style::default().add_modifier(Modifier::SLOW_BLINK));
+    let line = Line::from(vec![Span::raw(input), cursor]);
+    let paragraph = Paragraph::new(Text::from(line))
         .block(Block::bordered())
         .left_aligned();
     frame.render_widget(paragraph, area);

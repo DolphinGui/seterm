@@ -1,9 +1,6 @@
 use std::{
-    borrow::Cow,
-    path::Path,
+    path::{Path, PathBuf},
     process::ExitStatus,
-    rc::Rc,
-    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -12,17 +9,14 @@ use color_eyre::{
     eyre::{self, OptionExt},
 };
 use eyre::eyre;
-use futures::{
-    FutureExt, StreamExt,
-    future::{OptionFuture, pending},
-};
+use futures::{FutureExt, StreamExt, future::pending};
 use notify::Watcher;
 use ratatui::crossterm::event::Event as CrosstermEvent;
-use serialport::{DataBits, SerialPort};
+use serialport::SerialPort;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     select,
-    sync::{broadcast, mpsc},
+    sync::mpsc,
 };
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
 
@@ -43,12 +37,15 @@ pub enum ToAppMsg {
 pub enum FromAppMsg {
     ConnectDevice(SerialStream, String),
     WriteSerial(ToSerialData),
+    UploadFile(PathBuf, String),
 }
 
 #[derive(Debug)]
 pub enum AppEvent {
     SelectDevice(String),
     ConnectDevice(SerialStream, String),
+    UploadFile(PathBuf),
+    UploadCmd(String),
     Leave,
     Quit,
 }
@@ -128,6 +125,19 @@ struct ManagerTask {
     uploader: Option<FileWatcher>,
 }
 
+async fn maybe_recv<T>(rec: Option<&mut mpsc::UnboundedReceiver<T>>) -> Option<T> {
+    match rec {
+        Some(r) => r.recv().await,
+        None => pending().await,
+    }
+}
+
+async fn maybe_recv_bound<T>(rec: Option<&mut mpsc::Receiver<T>>) -> Option<T> {
+    match rec {
+        Some(r) => r.recv().await,
+        None => pending().await,
+    }
+}
 // the struct tokio_serial is nice as a builder
 // but is terrible for actually storing, which is kinda
 // of dumb since it contains very little actual stored information
@@ -180,7 +190,7 @@ impl ManagerTask {
     }
 
     async fn run(mut self) -> Result<()> {
-        use FromAppMsg::{ConnectDevice, WriteSerial};
+        use FromAppMsg::{ConnectDevice, UploadFile, WriteSerial};
         use FromFileWatcher::{DisonnectRequest, LogErr, LogResult, ReconnectRequest};
         let mut reader = crossterm::event::EventStream::new();
         // this is kinda stupid but is necessary to get rust to shut up
@@ -193,6 +203,9 @@ impl ManagerTask {
             if reset_serial {
                 self.serial = None;
                 let _ = self.to_app.send(ToAppMsg::SerialGone);
+                if let Some(u) = self.uploader.as_mut() {
+                    _ = u.to_watcher.send(ToFileWatcher::DoneDisconnect).await;
+                }
                 reset_serial = false;
             }
 
@@ -227,20 +240,8 @@ impl ManagerTask {
                 )
                 .unzip();
 
-            let serial_read = async {
-                match se_rx {
-                    Some(rx) => rx.recv().await,
-                    None => pending().await,
-                }
-            };
-
-            let file_read = async {
-                match self.uploader.as_mut() {
-                    Some(u) => u.from_watcher.recv().await,
-                    None => pending().await,
-                }
-            };
-
+            let serial_read = maybe_recv(se_rx);
+            let file_read = maybe_recv_bound(self.uploader.as_mut().map(|u| &mut u.from_watcher));
             let crossterm_event = reader.next().fuse();
             tokio::select! {
               _ = self.to_app.closed() => {
@@ -260,6 +261,13 @@ impl ManagerTask {
                 ConnectDevice(serial, name) => {
                    new_serial = Some((serial, name));
                 }
+                UploadFile(f, cmd) => {
+                   let up = match FileWatcher::new(&f, cmd) {
+                       Ok(u) => u,
+                       Err(e) => { _ = self.to_app.send(ToAppMsg::Log(format!("Unable to open file: {}", e))); continue;}
+                   };
+                   self.uploader = Some(up);
+                }
                }
               },
               r = serial_read => {
@@ -271,7 +279,13 @@ impl ManagerTask {
               f = file_read =>{
                   match f {
                     None => { reset_upload = true; },
-                    Some(DisonnectRequest) => { reset_serial = true;  },
+                    Some(DisonnectRequest) => {
+                     if self.serial.is_none(){
+                       _ = self.to_app.send(ToAppMsg::Log("Attempted to flash when nothing is connected".into()));
+                     }else{
+                       reset_serial = true;
+                     }
+                    },
                     Some(ReconnectRequest) => {
                         let Some(ref cfg) = old_config else {
                             continue;
@@ -436,7 +450,6 @@ impl notify::EventHandler for WatcherImpl {
             EventKind::{Create, Modify},
             event::{CreateKind::File, ModifyKind::Data},
         };
-        use std::process::{Command, Output};
         match event {
             Err(e) => {
                 _ = self.to_app.send(FromFileWatcher::LogErr(e.to_string()));
@@ -452,24 +465,7 @@ impl notify::EventHandler for WatcherImpl {
                     // we're already dead but haven't realized it
                     return;
                 }
-                let out = Command::new(&self.cmd[0]).args(&self.cmd[1..]).output();
-                match out {
-                    // This only watches 1 file, so we don't bother checking which file it was
-                    Ok(Output {
-                        status,
-                        stdout,
-                        stderr,
-                    }) => {
-                        let stdout = String::from_utf8_lossy(&stdout);
-                        let stderr = String::from_utf8_lossy(&stderr);
-                        _ = self.to_app.blocking_send(LogResult(
-                            status,
-                            stderr.into(),
-                            stdout.into(),
-                        ));
-                    }
-                    Err(e) => _ = self.to_app.blocking_send(LogErr(e.to_string().into())),
-                };
+                self.execute();
                 _ = self.to_app.blocking_send(ReconnectRequest);
             }
             _ => {}
@@ -477,12 +473,36 @@ impl notify::EventHandler for WatcherImpl {
     }
 }
 
+impl WatcherImpl {
+    fn execute(&self) {
+        use FromFileWatcher::{LogErr, LogResult};
+        use tokio::process::Command;
+        tokio::spawn(Command::new(&self.cmd[0]).args(&self.cmd[1..]).output());
+        /*match out {
+            // This only watches 1 file, so we don't bother checking which file it was
+            Ok(Output {
+                status,
+                stdout,
+                stderr,
+            }) => {
+                let stdout = String::from_utf8_lossy(&stdout);
+                let stderr = String::from_utf8_lossy(&stderr);
+                _ = self
+                    .to_app
+                    .blocking_send(LogResult(status, stderr.into(), stdout.into()));
+            }
+            Err(e) => _ = self.to_app.blocking_send(LogErr(e.to_string())),
+        };*/
+    }
+}
+
 impl FileWatcher {
-    pub fn new_pair(file: &Path, mut cmd: Vec<String>) -> Result<Self> {
+    pub fn new(file: &Path, cmd: String) -> Result<Self> {
         let filename = file.to_str().ok_or_eyre("Firmware filename is not UTF8")?;
+        let mut cmd = shlex::split(&cmd).ok_or_eyre("Unable to lex command")?;
         *cmd.iter_mut()
-            .find(|p| *p == "#BIN#")
-            .ok_or_eyre("Firmware arguments do not contain #FILE#")? = filename.into();
+            .find(|p| *p == "BAB")
+            .ok_or_eyre("Firmware arguments do not contain #BIN#")? = filename.into();
         let (to_app, from_watcher) = mpsc::channel(8);
         let (to_watcher, from_app) = mpsc::channel(8);
 
@@ -491,6 +511,7 @@ impl FileWatcher {
             from_app,
             cmd,
         };
+        watcher.execute();
         let mut watcher = notify::recommended_watcher(watcher)?;
         watcher.watch(file, notify::RecursiveMode::Recursive)?;
         Ok(Self {

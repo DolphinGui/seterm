@@ -154,7 +154,8 @@ impl Drawable for DeviceFinder {
             .map(format_device_info)
             .map(Text::raw)
             .collect();
-        let highlight_style = Style::default().reversed();
+        let
+          highlight_style = Style::default().reversed();
         let l = List::new(text)
             .block(Block::bordered())
             .highlight_style(highlight_style);

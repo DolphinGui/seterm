@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use clap::Parser;
 use eyre::eyre;
 
@@ -10,6 +8,7 @@ pub mod cli;
 pub mod device_finder;
 pub mod event;
 pub mod ui;
+pub mod fileviewer;
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
@@ -23,7 +22,7 @@ async fn main() -> color_eyre::Result<()> {
         Some(Err(_)) => return Err(eyre!("Unable to parse non-utf8 strings!")),
         None => None,
     };
-    let result = App::new().run(terminal, args.default_baud, dev).await;
+    let result = App::new().run(terminal, args.default_baud, dev, "".into()).await;
     ratatui::restore();
     result
 }
