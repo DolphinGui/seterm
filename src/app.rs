@@ -1,7 +1,7 @@
 use std::mem::take;
 
 use crate::{
-    device_finder::{DeviceConfigurer, DeviceFinder, Reactive},
+    device_finder::{Baud, DeviceConfigurer, DeviceFinder, Reactive},
     event::{
         AppEvent, EventHandler, FromAppMsg, FromSerialData, ToAppMsg, ToSerialData, pseudo_serial,
     },
@@ -71,9 +71,22 @@ impl App {
         }
     }
 
-    pub async fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
+    pub async fn run(
+        mut self,
+        mut terminal: DefaultTerminal,
+        default_baud: Baud,
+        try_device: Option<String>,
+    ) -> color_eyre::Result<()> {
         use ToAppMsg::{App, Crossterm, Log, RecieveSerial, SerialConnected, SerialGone};
         use crossterm::event::{Event::Key, KeyEventKind::Press};
+        if let Some(device) = try_device {
+            self.events
+                .to_self
+                .send(Log(format!("trying a device: {}", device)))?;
+            self.events
+                .to_self
+                .send(App(AppEvent::SelectDevice(device)))?;
+        }
         while self.running {
             terminal.draw(|frame| render_ui(&mut self, frame))?;
             match self.events.next().await? {
@@ -91,6 +104,7 @@ impl App {
                     self.popup = Some(Box::new(DeviceConfigurer::new(
                         s,
                         self.events.to_self.clone(),
+                        default_baud,
                     )))
                 }
                 App(AppEvent::ConnectDevice(d, p)) => {

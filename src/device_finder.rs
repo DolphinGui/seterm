@@ -1,3 +1,4 @@
+use clap::ValueEnum;
 use crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::{
     buffer::Buffer,
@@ -32,8 +33,8 @@ pub struct DeviceFinder {
     to_app: mpsc::UnboundedSender<ToAppMsg>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Baud {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Baud {
     B48 = 4800,
     B96 = 9600,
     B192 = 19200,
@@ -162,11 +163,11 @@ impl Drawable for DeviceFinder {
 }
 
 impl DeviceConfigurer {
-    pub fn new(path: String, to_app: mpsc::UnboundedSender<ToAppMsg>) -> Self {
+    pub fn new(path: String, to_app: mpsc::UnboundedSender<ToAppMsg>, baud: Baud) -> Self {
         Self {
             path,
             table_state: TableState::new(),
-            baud: Baud::B1152,
+            baud,
             bits: DataBits::Eight,
             flow: FlowControl::None,
             parity: Parity::None,
