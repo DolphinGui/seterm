@@ -1,19 +1,30 @@
-use std::time::Duration;
+use std::{
+    borrow::Cow,
+    path::Path,
+    process::ExitStatus,
+    rc::Rc,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use color_eyre::{
     Report, Result,
     eyre::{self, OptionExt},
 };
 use eyre::eyre;
-use futures::{FutureExt, StreamExt, future::OptionFuture};
+use futures::{
+    FutureExt, StreamExt,
+    future::{OptionFuture, pending},
+};
+use notify::Watcher;
 use ratatui::crossterm::event::Event as CrosstermEvent;
-use serialport::SerialPort;
+use serialport::{DataBits, SerialPort};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     select,
-    sync::mpsc,
+    sync::{broadcast, mpsc},
 };
-use tokio_serial::SerialStream;
+use tokio_serial::{SerialPortBuilderExt, SerialStream};
 
 use tokio::time::sleep as tokio_sleep;
 
@@ -25,19 +36,19 @@ pub enum ToAppMsg {
     SerialConnected(String),
     SerialGone,
     Log(String),
+    LogResult(ExitStatus, String, String),
 }
 
 #[derive(Debug)]
 pub enum FromAppMsg {
-    ConnectDevice(SerialStream),
+    ConnectDevice(SerialStream, String),
     WriteSerial(ToSerialData),
 }
 
 #[derive(Debug)]
 pub enum AppEvent {
-    RequestAvailableDevices,
     SelectDevice(String),
-    ConnectDevice(SerialStream),
+    ConnectDevice(SerialStream, String),
     Leave,
     Quit,
 }
@@ -50,6 +61,18 @@ pub enum ToSerialData {
     Disconnect,
     RequestStatus,
 }
+
+enum ToFileWatcher {
+    DoneDisconnect,
+}
+
+enum FromFileWatcher {
+    LogErr(String),
+    LogResult(ExitStatus, String, String),
+    DisonnectRequest,
+    ReconnectRequest,
+}
+
 #[derive(Clone, Debug)]
 pub enum FromSerialData {
     Data(Vec<u8>),
@@ -67,8 +90,8 @@ impl EventHandler {
     pub fn new() -> Self {
         let (to_app, from_mgr) = mpsc::unbounded_channel();
         let (to_mgr, from_app) = mpsc::unbounded_channel();
-        let actor = ManagerTask::new(to_app.clone(), from_app);
-        tokio::spawn(async { actor.run().await });
+        let to_app2 = to_app.clone();
+        tokio::spawn(async move { ManagerTask::new(to_app2, from_app).run().await });
         Self {
             to_self: to_app,
             from_mgr,
@@ -102,6 +125,19 @@ struct ManagerTask {
     to_app: mpsc::UnboundedSender<ToAppMsg>,
     from_app: mpsc::UnboundedReceiver<FromAppMsg>,
     serial: Option<SerialHandler>,
+    uploader: Option<FileWatcher>,
+}
+
+// the struct tokio_serial is nice as a builder
+// but is terrible for actually storing, which is kinda
+// of dumb since it contains very little actual stored information
+struct SerialConfig {
+    path: String,
+    baud: u32,
+    data: tokio_serial::DataBits,
+    flow: tokio_serial::FlowControl,
+    parity: tokio_serial::Parity,
+    stop: tokio_serial::StopBits,
 }
 
 impl ManagerTask {
@@ -113,15 +149,45 @@ impl ManagerTask {
             to_app,
             from_app,
             serial: None,
+            uploader: None,
         }
+    }
+
+    fn get_config(serial: &SerialStream, path: String) -> Result<SerialConfig> {
+        let baud = serial.baud_rate()?;
+        let data = serial.data_bits()?;
+        let flow = serial.flow_control()?;
+        let parity = serial.parity()?;
+        let stop = serial.stop_bits()?;
+        Ok(SerialConfig {
+            path,
+            baud,
+            data,
+            flow,
+            parity,
+            stop,
+        })
+    }
+
+    fn create_stream(cfg: &SerialConfig) -> Result<SerialStream> {
+        tokio_serial::new(cfg.path.clone(), cfg.baud)
+            .data_bits(cfg.data)
+            .flow_control(cfg.flow)
+            .parity(cfg.parity)
+            .stop_bits(cfg.stop)
+            .open_native_async()
+            .map_err(|e| e.into())
     }
 
     async fn run(mut self) -> Result<()> {
         use FromAppMsg::{ConnectDevice, WriteSerial};
+        use FromFileWatcher::{DisonnectRequest, LogErr, LogResult, ReconnectRequest};
         let mut reader = crossterm::event::EventStream::new();
         // this is kinda stupid but is necessary to get rust to shut up
         let mut reset_serial = false;
-        let mut new_serial: Option<SerialStream> = None;
+        let mut reset_upload = false;
+        let mut new_serial: Option<(SerialStream, String)> = None;
+        let mut old_config: Option<SerialConfig> = None;
         loop {
             let no_device = eyre!("No device connected!");
             if reset_serial {
@@ -129,8 +195,23 @@ impl ManagerTask {
                 let _ = self.to_app.send(ToAppMsg::SerialGone);
                 reset_serial = false;
             }
-            if let Some(se) = new_serial.take() {
-                let _ = self.to_app.send(ToAppMsg::SerialConnected(
+
+            if reset_upload {
+                self.uploader = None;
+                reset_upload = false;
+            }
+
+            if let Some((se, name)) = new_serial.take() {
+                match Self::get_config(&se, name) {
+                    Ok(s) => old_config = Some(s),
+                    Err(e) => {
+                        _ = self
+                            .to_app
+                            .send(ToAppMsg::Log(format!("Failed to connect to serial: {}", e)));
+                        continue;
+                    }
+                };
+                _ = self.to_app.send(ToAppMsg::SerialConnected(
                     se.name().unwrap_or("Virtual".into()),
                 ));
                 self.serial = Some(SerialHandler::new(se));
@@ -146,7 +227,20 @@ impl ManagerTask {
                 )
                 .unzip();
 
-            let serial_read: OptionFuture<_> = se_rx.map(|rx| rx.recv()).into();
+            let serial_read = async {
+                match se_rx {
+                    Some(rx) => rx.recv().await,
+                    None => pending().await,
+                }
+            };
+
+            let file_read = async {
+                match self.uploader.as_mut() {
+                    Some(u) => u.from_watcher.recv().await,
+                    None => pending().await,
+                }
+            };
+
             let crossterm_event = reader.next().fuse();
             tokio::select! {
               _ = self.to_app.closed() => {
@@ -163,18 +257,33 @@ impl ManagerTask {
                      .and_then(|serial| serial.send(s).map_err(|e| e.into()))
                      .map_err(|e| self.to_app.send(ToAppMsg::RecieveSerial(Err(e))));
                 }
-                ConnectDevice(serial) => {
-                   new_serial = Some(serial);
+                ConnectDevice(serial, name) => {
+                   new_serial = Some((serial, name));
                 }
                }
               },
               r = serial_read => {
                 match r{
-                  // serial does not exist, which is normal
-                  None => { },
-                  // serial is disconnected, in which case we need to tell the app and clear the serial
-                  Some(None) => { let _ = self.to_app.send(ToAppMsg::SerialGone); reset_serial = true;  }
-                  Some(Some(data)) => {let _ = self.to_app.send(ToAppMsg::RecieveSerial(data));}
+                  None => {  _ = self.to_app.send(ToAppMsg::SerialGone); reset_serial = true;  }
+                  Some(data) => {  _ = self.to_app.send(ToAppMsg::RecieveSerial(data));}
+                }
+              }
+              f = file_read =>{
+                  match f {
+                    None => { reset_upload = true; },
+                    Some(DisonnectRequest) => { reset_serial = true;  },
+                    Some(ReconnectRequest) => {
+                        let Some(ref cfg) = old_config else {
+                            continue;
+                        };
+                        let Ok(stream) = Self::create_stream(cfg) else{
+                          _ = self.to_app.send(ToAppMsg::Log("Failed to construct serial configuration".into()));
+                          continue;
+                        };
+                        new_serial = Some((stream, cfg.path.clone()));
+                    },
+                    Some(LogErr(e) ) => { _ = self.to_app.send(ToAppMsg::Log(e))  },
+                    Some(LogResult(s, o, e)) => { _ = self.to_app.send(ToAppMsg::LogResult(s, o, e))  },
                 }
               }
             };
@@ -249,7 +358,7 @@ impl SerialHandler {
                                 Ok(d) => d,
                                 Err(e) => { _ = data_tx.send(Err(e.into())); true }
                             };
-                              
+
                             if data_tx.send(
                               Ok(
                                 FromSerialData::Status{ dtr, cts }
@@ -262,7 +371,7 @@ impl SerialHandler {
                     let _ =  data_tx.send(Err(err));
                     break;
                 }
-                    }
+                };
             }
         });
 
@@ -305,4 +414,89 @@ pub fn pseudo_serial() -> SerialStream {
         }
     });
     computer
+}
+
+struct FileWatcher {
+    from_watcher: mpsc::Receiver<FromFileWatcher>,
+    to_watcher: mpsc::Sender<ToFileWatcher>,
+    watcher: notify::RecommendedWatcher,
+}
+
+struct WatcherImpl {
+    to_app: mpsc::Sender<FromFileWatcher>,
+    from_app: mpsc::Receiver<ToFileWatcher>,
+    cmd: Vec<String>,
+}
+
+impl notify::EventHandler for WatcherImpl {
+    fn handle_event(&mut self, event: notify::Result<notify::Event>) {
+        use FromFileWatcher::{DisonnectRequest, LogErr, LogResult, ReconnectRequest};
+        use notify::{
+            Event,
+            EventKind::{Create, Modify},
+            event::{CreateKind::File, ModifyKind::Data},
+        };
+        use std::process::{Command, Output};
+        match event {
+            Err(e) => {
+                _ = self.to_app.send(FromFileWatcher::LogErr(e.to_string()));
+            }
+            Ok(Event {
+                kind: Modify(Data(..)) | Create(File),
+                ..
+            }) => {
+                _ = self.to_app.blocking_send(DisonnectRequest);
+                // wait for disconnect to finish
+                let r = self.from_app.blocking_recv();
+                if r.is_none() {
+                    // we're already dead but haven't realized it
+                    return;
+                }
+                let out = Command::new(&self.cmd[0]).args(&self.cmd[1..]).output();
+                match out {
+                    // This only watches 1 file, so we don't bother checking which file it was
+                    Ok(Output {
+                        status,
+                        stdout,
+                        stderr,
+                    }) => {
+                        let stdout = String::from_utf8_lossy(&stdout);
+                        let stderr = String::from_utf8_lossy(&stderr);
+                        _ = self.to_app.blocking_send(LogResult(
+                            status,
+                            stderr.into(),
+                            stdout.into(),
+                        ));
+                    }
+                    Err(e) => _ = self.to_app.blocking_send(LogErr(e.to_string().into())),
+                };
+                _ = self.to_app.blocking_send(ReconnectRequest);
+            }
+            _ => {}
+        };
+    }
+}
+
+impl FileWatcher {
+    pub fn new_pair(file: &Path, mut cmd: Vec<String>) -> Result<Self> {
+        let filename = file.to_str().ok_or_eyre("Firmware filename is not UTF8")?;
+        *cmd.iter_mut()
+            .find(|p| *p == "#BIN#")
+            .ok_or_eyre("Firmware arguments do not contain #FILE#")? = filename.into();
+        let (to_app, from_watcher) = mpsc::channel(8);
+        let (to_watcher, from_app) = mpsc::channel(8);
+
+        let watcher = WatcherImpl {
+            to_app,
+            from_app,
+            cmd,
+        };
+        let mut watcher = notify::recommended_watcher(watcher)?;
+        watcher.watch(file, notify::RecursiveMode::Recursive)?;
+        Ok(Self {
+            to_watcher,
+            from_watcher,
+            watcher,
+        })
+    }
 }

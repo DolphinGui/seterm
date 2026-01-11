@@ -93,11 +93,10 @@ impl App {
                         self.events.to_self.clone(),
                     )))
                 }
-                App(AppEvent::ConnectDevice(d)) => {
-                    self.events.send(FromAppMsg::ConnectDevice(d));
+                App(AppEvent::ConnectDevice(d, p)) => {
+                    self.events.send(FromAppMsg::ConnectDevice(d, p));
                     self.popup = None;
                 }
-                App(AppEvent::RequestAvailableDevices) => todo!(),
                 App(AppEvent::Leave) => {
                     if self.popup.is_some() {
                         self.popup = None
@@ -105,7 +104,10 @@ impl App {
                         self.running = false
                     }
                 }
-                Log(m) => self.log_err_str(&m),
+                Log(m) => self.log_err_str(m),
+                ToAppMsg::LogResult(exit_status, out, err) => {
+                    self.log_err_str(format!("{}: {}\n{}", exit_status, out, err));
+                }
             }
         }
         Ok(())
@@ -124,7 +126,8 @@ impl App {
                 self.events.send_self(AppEvent::Quit)
             }
             Char('s') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.events.send(FromAppMsg::ConnectDevice(pseudo_serial()));
+                self.events
+                    .send(FromAppMsg::ConnectDevice(pseudo_serial(), "".into()));
             }
             Char('d') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.events
@@ -174,18 +177,17 @@ impl App {
 
     fn enter_input(&mut self) {
         self.term_input.push('\n');
-        self.events
-            .send(FromAppMsg::WriteSerial(ToSerialData::Data(take(
-                &mut self.term_input,
-            ))));
+        self.events.send(FromAppMsg::WriteSerial(ToSerialData::Data(
+            take(&mut self.term_input).into(),
+        )));
     }
 
     fn log_err(&mut self, report: Report) {
         self.status.log.push(report.to_string());
     }
 
-    fn log_err_str(&mut self, report: &str) {
-        self.status.log.push(report.into());
+    fn log_err_str(&mut self, report: String) {
+        self.status.log.push(report);
     }
 
     fn find_devices(&mut self) {
@@ -208,7 +210,7 @@ impl App {
         })
         .collect();
         if devices.is_empty() {
-            self.log_err_str("No devices found");
+            self.log_err_str("No devices found".into());
         } else {
             self.popup = Some(Box::new(DeviceFinder::new(
                 devices,

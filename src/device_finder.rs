@@ -1,4 +1,3 @@
-
 use crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::{
     buffer::Buffer,
@@ -245,7 +244,11 @@ impl EventListener for DeviceConfigurer {
                     .stop_bits(self.stop)
                     .dtr_on_open(self.dtr);
                 match config.open_native_async() {
-                    Ok(s) => _ = self.to_app.send(ToAppMsg::App(AppEvent::ConnectDevice(s))),
+                    Ok(s) => {
+                        _ = self
+                            .to_app
+                            .send(ToAppMsg::App(AppEvent::ConnectDevice(s, self.path.clone())))
+                    }
                     Err(e) => _ = self.to_app.send(ToAppMsg::Log(e.description)),
                 };
             }
