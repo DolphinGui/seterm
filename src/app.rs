@@ -204,6 +204,7 @@ impl App {
                         .wrap_err("Could not connect to serial port")?;
                     let serial = serial_handler(serial, app.clone());
                     app.send_app(AppEvent::SerialConnect(serial, config));
+                    app.send_notif(GuiEvent::SerialDone);
                     Ok(())
                 }
                 .await;
@@ -253,7 +254,7 @@ impl App {
             if se.send(data).is_err() {
                 self.serial = None;
             }
-        } else {
+        } else if data != ToSerialData::Disconnect {
             self.to_self.log(
                 crate::event::Severity::Error,
                 "Not currently connected to a device".into(),

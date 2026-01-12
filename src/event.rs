@@ -51,6 +51,7 @@ pub enum GuiEvent {
     Crossterm(CrosstermEvent),
     Log(Severity, String),
     Serial(FromSerialData),
+    SerialDone,
 }
 
 #[derive(Debug)]
@@ -65,7 +66,7 @@ pub enum AppEvent {
     Quit,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToSerialData {
     Data(String),
     CTS(bool),
@@ -110,6 +111,9 @@ impl Messenger {
     }
     pub fn send_serial(&self, d: FromSerialData) {
         _ = self.0.send(ToAppEvent::Gui(GuiEvent::Serial(d)));
+    }
+    pub fn send_notif(&self, d: GuiEvent) {
+        _ = self.0.send(ToAppEvent::Gui(d));
     }
     pub fn send_file(&self, f: FromFileWatcher) {
         _ = self.0.send(ToAppEvent::App(AppEvent::Watcher(f)));

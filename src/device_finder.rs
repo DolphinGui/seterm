@@ -111,7 +111,7 @@ impl DeviceFinder {
 
 impl EventListener for DeviceFinder {
     fn listen(&mut self, e: &GuiEvent) -> bool {
-        use GuiEvent::{Crossterm, Serial};
+        use GuiEvent::{Crossterm, SerialDone};
         use KeyCode::{Down, Enter, Up};
         use crossterm::event::Event::Key;
         match e {
@@ -124,7 +124,7 @@ impl EventListener for DeviceFinder {
                     _ = tx.send(d.port_name.clone());
                 };
             }
-            Serial(_) => {
+            SerialDone => {
                 self.alive = false;
                 return false;
             }
@@ -283,7 +283,7 @@ impl DeviceConfigurer {
 
 impl EventListener for DeviceConfigurer {
     fn listen(&mut self, e: &GuiEvent) -> bool {
-        use GuiEvent::{Crossterm, Serial};
+        use GuiEvent::{Crossterm, SerialDone};
         use KeyCode::{Down, Enter, Left, Right, Up};
         use crossterm::event::Event::Key;
         match e {
@@ -302,7 +302,7 @@ impl EventListener for DeviceConfigurer {
                     _ = tx.send(take(&mut self.config));
                 }
             }
-            Serial(_) => {
+            SerialDone => {
                 self.alive = false;
                 return false;
             }

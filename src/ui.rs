@@ -53,6 +53,7 @@ impl EventListener for Dashboard {
             }
             Crossterm(c) => self.handle_term(c),
             Serial(s) => self.handle_serial(s),
+            GuiEvent::SerialDone => false,
         }
     }
 }
