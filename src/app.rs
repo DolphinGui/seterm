@@ -67,29 +67,37 @@ impl App {
         _try_device: Option<String>,
         default_cmd: String,
     ) -> color_eyre::Result<()> {
+        use AppEvent::{
+            Leave, Quit, RequestSerial, RequestUpload, SendSerial, SendUpload, SerialConnect,
+            Watcher,
+        };
+        use ToAppEvent::{App, Gui, Popup};
         trace!("Starting main loop!");
         while self.running {
             terminal.draw(|frame| self.draw(frame))?;
             match self.next().await? {
-                ToAppEvent::Gui(g) => self.handle_key_events(g),
-                ToAppEvent::App(AppEvent::Leave) => _ = self.stack.pop(),
-                ToAppEvent::App(AppEvent::Quit) => self.running = false,
-                ToAppEvent::App(AppEvent::RequestSerial) => self.connect_serial(default_baud)?,
-                ToAppEvent::App(AppEvent::RequestUpload) => {
-                    self.upload_file(default_cmd.clone(), true)?
+                Gui(g) => self.handle_key_events(g),
+                App(Leave) => {
+                    _ = self.stack.pop();
+                    if self.stack.is_empty() {
+                        return Ok(());
+                    }
                 }
-                ToAppEvent::App(AppEvent::SendSerial(s)) => {
+                App(Quit) => self.running = false,
+                App(RequestSerial) => self.connect_serial(default_baud),
+                App(RequestUpload) => self.upload_file(default_cmd.clone(), true),
+                App(SendSerial(s)) => {
                     self.send_serial(s);
                 }
-                ToAppEvent::App(AppEvent::SerialConnect(s, c)) => {
+                App(SerialConnect(s, c)) => {
                     self.serial = Some(s);
                     self.serial_cfg = Some(c);
                 }
-                ToAppEvent::App(AppEvent::SendUpload(u)) => {
+                App(SendUpload(u)) => {
                     self.uploader = Some(u);
                 }
-                ToAppEvent::App(AppEvent::Watcher(w)) => self.handle_watcher(w),
-                ToAppEvent::Popup(reactive) => self.stack.push(reactive),
+                App(Watcher(w)) => self.handle_watcher(w),
+                Popup(reactive) => self.stack.push(reactive),
             }
         }
         Ok(())
@@ -124,6 +132,12 @@ impl App {
             (KeyModifiers::CONTROL, Char('c')) => {
                 self.to_self.send_app(AppEvent::Quit);
             }
+            (KeyModifiers::CONTROL, Char('f')) => {
+                self.to_self.send_app(AppEvent::RequestSerial);
+            }
+            (KeyModifiers::CONTROL, Char('u')) => {
+                self.to_self.send_app(AppEvent::RequestUpload);
+            }
             _ => {}
         }
     }
@@ -140,7 +154,20 @@ impl App {
                 }
                 self.serial = None;
             }
-            FromFileWatcher::ReconnectRequest => {}
+            FromFileWatcher::ReconnectRequest => {
+                let cfg = self.serial_cfg.clone().unwrap();
+                let serial = match cfg.to_serial() {
+                    Ok(o) => o,
+                    Err(e) => {
+                        self.to_self.log(
+                            Severity::Error,
+                            format!("Could not connect to serial: {}", e),
+                        );
+                        return;
+                    }
+                };
+                self.serial = Some(serial_handler(serial, self.to_self.clone()));
+            }
         }
     }
 
@@ -160,7 +187,7 @@ impl App {
         trace!("Done Drawing");
     }
 
-    fn connect_serial(&mut self, baud: Baud) -> Result<()> {
+    fn connect_serial(&mut self, baud: Baud) {
         use crate::event::Severity;
         let app = self.to_self.clone();
         tokio::spawn(
@@ -190,10 +217,9 @@ impl App {
             }
             .instrument(tracing::info_span!("Serial sequence")),
         );
-        Ok(())
     }
 
-    fn upload_file(&mut self, _path: String, _autorun: bool) -> Result<()> {
+    fn upload_file(&mut self, _path: String, _autorun: bool) {
         use crate::event::Severity;
         let to_dash = self.to_self.clone();
         tokio::spawn(
@@ -218,7 +244,6 @@ impl App {
             }
             .instrument(tracing::info_span!("Watcher sequence")),
         );
-        Ok(())
     }
     async fn next(&mut self) -> color_eyre::Result<ToAppEvent> {
         self.inbox
