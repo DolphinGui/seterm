@@ -28,7 +28,7 @@ pub struct Dashboard {
 
 #[derive(Default)]
 struct Status {
-    cts: bool,
+    rts: bool,
     dtr: bool,
     device: String,
     log: Vec<(Severity, String)>,
@@ -80,7 +80,7 @@ impl Dashboard {
             code, modifiers, ..
         } = event;
         use AppEvent::SendSerial;
-        use ToSerialData::{CTS, DTR};
+        use ToSerialData::{DTR, RTS};
         use crossterm::event::{
             KeyCode::{Backspace, Char, Enter},
             KeyEvent,
@@ -100,7 +100,7 @@ impl Dashboard {
                 self.to_app.send_app(SendSerial(DTR(!self.status.dtr)));
             }
             (KeyModifiers::CONTROL, Char('r')) => {
-                self.to_app.send_app(SendSerial(CTS(!self.status.cts)));
+                self.to_app.send_app(SendSerial(RTS(!self.status.rts)));
             }
             _ => return false,
         }
@@ -122,9 +122,9 @@ impl Dashboard {
                     }
                 }
             }
-            FromSerialData::Status { dtr, cts } => {
+            FromSerialData::Status { dtr, rts } => {
                 self.status.dtr = *dtr;
-                self.status.cts = *cts;
+                self.status.rts = *rts;
             }
             FromSerialData::Connect(s) => self.status.device = s.clone(),
             FromSerialData::Gone => self.status.device.clear(),
@@ -204,7 +204,7 @@ fn render_status_block(stat: &Status, area: Rect, frame: &mut Buffer) {
 
     const ON: &str = "●";
     const OFF: &str = "○";
-    let cts = if stat.cts { ON } else { OFF };
+    let rts = if stat.rts { ON } else { OFF };
     let dtr = if stat.dtr { ON } else { OFF };
 
     let log_block = Block::bordered();
@@ -217,7 +217,7 @@ fn render_status_block(stat: &Status, area: Rect, frame: &mut Buffer) {
         .map(|(sev, str)| render_text(*sev, str));
     render_log(lines, log_zone, frame);
 
-    let status = format!("CTS: {}\nDTR: {}\nConnected: {}", cts, dtr, stat.device,);
+    let status = format!("RTS: {}\nDTR: {}\nConnected: {}", rts, dtr, stat.device,);
 
     let status_block = Paragraph::new(status).block(Block::bordered()).centered();
     status_block.render(*stats, frame);
@@ -259,7 +259,7 @@ impl std::fmt::Debug for TerminalStatus {
 impl std::fmt::Debug for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Status")
-            .field("cts", &self.cts)
+            .field("rts", &self.rts)
             .field("dtr", &self.dtr)
             .field("device", &self.device)
             .field("log_size", &self.log.len())

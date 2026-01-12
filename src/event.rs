@@ -70,7 +70,7 @@ pub enum AppEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToSerialData {
     Data(String),
-    CTS(bool),
+    RTS(bool),
     DTR(bool),
     Disconnect,
     RequestStatus,
@@ -80,7 +80,7 @@ pub enum ToSerialData {
 pub enum FromSerialData {
     Connect(String),
     Data(Vec<u8>),
-    Status { dtr: bool, cts: bool },
+    Status { dtr: bool, rts: bool },
     Gone,
 }
 
@@ -161,7 +161,7 @@ impl SerialImpl {
         };
         match data {
             ToSerialData::Data(d) => self.device.write_all(d.as_bytes()).await?,
-            ToSerialData::CTS(b) => {
+            ToSerialData::RTS(b) => {
                 trace!("Writing RTS = {}", b);
                 self.device.write_request_to_send(b)?;
                 self.read_stats()?;
@@ -183,7 +183,7 @@ impl SerialImpl {
         let rts = self.device.read_clear_to_send()?;
         trace!("Read stats: DTR: {} RTS: {}", dtr, rts);
         self.data_tx
-            .send_serial(FromSerialData::Status { dtr, cts: rts });
+            .send_serial(FromSerialData::Status { dtr, rts });
         Ok(())
     }
 }
