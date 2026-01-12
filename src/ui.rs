@@ -97,10 +97,12 @@ impl Dashboard {
                 self.send_serial();
             }
             (KeyModifiers::CONTROL, Char('d')) => {
-                self.to_app.send_app(SendSerial(DTR(!self.status.dtr)));
+                self.status.dtr = !self.status.dtr;
+                self.to_app.send_app(SendSerial(DTR(self.status.dtr)));
             }
             (KeyModifiers::CONTROL, Char('r')) => {
-                self.to_app.send_app(SendSerial(RTS(!self.status.rts)));
+                self.status.rts = !self.status.rts;
+                self.to_app.send_app(SendSerial(RTS(self.status.rts)));
             }
             _ => return false,
         }
@@ -121,10 +123,6 @@ impl Dashboard {
                         None => self.term_state.text.push(line.into()),
                     }
                 }
-            }
-            FromSerialData::Status { dtr, rts } => {
-                self.status.dtr = *dtr;
-                self.status.rts = *rts;
             }
             FromSerialData::Connect(s) => self.status.device = s.clone(),
             FromSerialData::Gone => self.status.device.clear(),

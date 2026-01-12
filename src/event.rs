@@ -73,14 +73,12 @@ pub enum ToSerialData {
     RTS(bool),
     DTR(bool),
     Disconnect,
-    RequestStatus,
 }
 
 #[derive(Clone, Debug)]
 pub enum FromSerialData {
     Connect(String),
     Data(Vec<u8>),
-    Status { dtr: bool, rts: bool },
     Gone,
 }
 
@@ -164,26 +162,14 @@ impl SerialImpl {
             ToSerialData::RTS(b) => {
                 trace!("Writing RTS = {}", b);
                 self.device.write_request_to_send(b)?;
-                self.read_stats()?;
             }
             ToSerialData::DTR(b) => {
                 trace!("Writing DTR = {}", b);
                 self.device.write_data_terminal_ready(b)?;
-                self.read_stats()?;
             }
             ToSerialData::Disconnect => self.alive = false,
-            ToSerialData::RequestStatus => self.read_stats()?,
         };
 
-        Ok(())
-    }
-
-    fn read_stats(&mut self) -> Result<()> {
-        let dtr = self.device.read_data_set_ready()?;
-        let rts = self.device.read_clear_to_send()?;
-        trace!("Read stats: DTR: {} RTS: {}", dtr, rts);
-        self.data_tx
-            .send_serial(FromSerialData::Status { dtr, rts });
         Ok(())
     }
 }
