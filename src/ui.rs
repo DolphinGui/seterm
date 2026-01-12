@@ -1,5 +1,6 @@
 use std::mem::take;
 
+use crossterm::event::{KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     buffer::Buffer,
@@ -12,7 +13,9 @@ use ratatui::{
 };
 use tracing::{instrument, trace};
 
-use crate::event::{Drawable, EventListener, FromSerialData, GuiEvent, Messenger, Severity};
+use crate::event::{
+    AppEvent, Drawable, EventListener, FromSerialData, GuiEvent, Messenger, Severity, ToSerialData,
+};
 
 #[derive(Debug)]
 pub struct Dashboard {
@@ -36,11 +39,6 @@ struct TerminalStatus {
     text: Vec<String>,
     scroll_index: usize,
     scroll_state: ScrollbarState,
-}
-
-fn is_char(m: crossterm::event::KeyModifiers) -> bool {
-    m.difference(crossterm::event::KeyModifiers::SHIFT)
-        .is_empty()
 }
 
 impl EventListener for Dashboard {
@@ -70,39 +68,42 @@ impl Dashboard {
     }
 
     fn handle_term(&mut self, e: &crossterm::event::Event) -> bool {
+        use crossterm::event::Event::Key;
+        if let Key(k) = e {
+            self.handle_keybinds(*k);
+        }
+        true
+    }
+
+    fn handle_keybinds(&mut self, event: KeyEvent) -> bool {
+        let KeyEvent {
+            code, modifiers, ..
+        } = event;
+        use AppEvent::SendSerial;
+        use ToSerialData::{CTS, DTR};
         use crossterm::event::{
-            Event::Key,
             KeyCode::{Backspace, Char, Enter},
             KeyEvent,
         };
-        match e {
-            Key(KeyEvent {
-                code: Char(c),
-                modifiers,
-                ..
-            }) if is_char(*modifiers) => {
-                self.term_input.push(*c);
+        match (modifiers, code) {
+            (KeyModifiers::NONE | KeyModifiers::SHIFT, Char(c)) => {
+                self.term_input.push(c);
             }
-
-            Key(KeyEvent {
-                code: Backspace,
-                modifiers,
-                ..
-            }) if modifiers.is_empty() => {
+            (KeyModifiers::NONE, Backspace) => {
                 _ = self.term_input.pop();
             }
-            Key(KeyEvent {
-                code: Enter,
-                modifiers,
-                ..
-            }) if modifiers.is_empty() => {
+            (KeyModifiers::NONE, Enter) => {
                 self.term_input.push('\n');
                 self.send_serial();
             }
-            _ => {
-                return false;
+            (KeyModifiers::CONTROL, Char('d')) => {
+                self.to_app.send_app(SendSerial(DTR(!self.status.dtr)));
             }
-        };
+            (KeyModifiers::CONTROL, Char('r')) => {
+                self.to_app.send_app(SendSerial(CTS(!self.status.cts)));
+            }
+            _ => return false,
+        }
         true
     }
 
@@ -133,8 +134,7 @@ impl Dashboard {
 
     fn send_serial(&mut self) {
         use crate::event::{AppEvent::SendSerial, ToSerialData::Data};
-        _ = self
-            .to_app
+        self.to_app
             .send_app(SendSerial(Data(take(&mut self.term_input))));
     }
 }

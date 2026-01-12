@@ -17,6 +17,7 @@ use tokio::{
 use tokio_serial::SerialStream;
 
 use tokio::time::sleep as tokio_sleep;
+use tracing::{Instrument, info_span, instrument, trace};
 
 use crate::device_finder::DeviceConfig;
 
@@ -139,85 +140,95 @@ pub fn crossterm_handler(to_app: Messenger) {
     });
 }
 
+#[derive(Debug)]
+struct SerialImpl {
+    data_tx: Messenger,
+    device: SerialStream,
+    alive: bool,
+}
+
+impl SerialImpl {
+    fn read(&mut self, data: &[u8]) {
+        trace!("Sending data");
+        self.data_tx
+            .send_serial(FromSerialData::Data(Vec::from(data)));
+    }
+    #[instrument]
+    async fn write(&mut self, event: Option<ToSerialData>) -> Result<()> {
+        let Some(data) = event else {
+            self.alive = false;
+            return Ok(());
+        };
+        match data {
+            ToSerialData::Data(d) => self.device.write_all(d.as_bytes()).await?,
+            ToSerialData::CTS(b) => {
+                trace!("Writing RTS = {}", b);
+                self.device.write_request_to_send(b)?;
+                self.read_stats()?;
+            }
+            ToSerialData::DTR(b) => {
+                trace!("Writing DTR = {}", b);
+                self.device.write_data_terminal_ready(b)?;
+                self.read_stats()?;
+            }
+            ToSerialData::Disconnect => self.alive = false,
+            ToSerialData::RequestStatus => self.read_stats()?,
+        };
+
+        Ok(())
+    }
+
+    fn read_stats(&mut self) -> Result<()> {
+        let dtr = self.device.read_data_set_ready()?;
+        let rts = self.device.read_clear_to_send()?;
+        trace!("Read stats: DTR: {} RTS: {}", dtr, rts);
+        self.data_tx
+            .send_serial(FromSerialData::Status { dtr, cts: rts });
+        Ok(())
+    }
+}
+
 pub fn serial_handler(
-    mut device: SerialStream,
+    device: SerialStream,
     data_tx: Messenger,
 ) -> mpsc::UnboundedSender<ToSerialData> {
     use Severity::Error;
-    use ToSerialData::{CTS, DTR, Data, Disconnect, RequestStatus};
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        data_tx.send_serial(FromSerialData::Connect(
-            device.name().unwrap_or("Virtual".into()),
-        ));
-        let mut buf = [0; 128];
-        let mut alive = true;
-        while alive {
-            // I hate the formatting, and macros are atrocious
-            // unfortunately, there's literally no better way to represent the problem
-            select! {
-               _ = data_tx.0.closed() => break,
-              read = device.read(&mut buf) => { let len = match read {
-                    Ok(l) => l,
-                    Err(e) => {
-                        let _ = data_tx.log(Error, format!("Error reading serial: {}",e)) ;
-                        break;
-                    }
-                };
-                    if len == 0 {
-                        let _ = data_tx.log(Error, "Serial has been disconnected!".into());
-                        break;
-                    } else {
-                        data_tx.send_serial(FromSerialData::Data(Vec::from(&buf[0..len])));
-                    }
-                },
-                event = event_rx.recv() => {
-                let err: Report = match event {
-                    Some(Data(s)) => {
-                        let Err(e) = device.write_all(s.as_bytes()).await else {
-                            continue;
-                        };
-                        e.into()
-                    }
-                    Some(DTR(b)) => {
-                        let Err(e) = device.write_data_terminal_ready(b) else {
-                            continue;
-                        };
-                        e.into()
-                    }
-                    Some(CTS(b)) => {
-                        let Err(e) = device.write_request_to_send(b) else {
-                            continue;
-                        };
-                        e.into()
-                    }
-                    Some(Disconnect) =>{
-                        alive = false; continue;
-                    }
-                    Some(RequestStatus) =>{
-                        let dtr = match device.read_data_set_ready(){
-                            Ok(d) => d,
-                            Err(e) => { data_tx.log(Error, format!("{}", e)); true }
-                        };
-                        let cts = match device.read_clear_to_send(){
-                            Ok(d) => d,
-                            Err(e) => { data_tx.log(Error, format!("{}", e)); true }
-                        };
-
-                        data_tx.send_serial(
-                            FromSerialData::Status{ dtr, cts }
-                        );
-                        continue;
-                    }
-                    None => eyre!("Serial terminal closed!"),
-                };
-                let _ =  data_tx.log(Error, format!("{}", err));
-                break;
-            }
+    tokio::spawn(
+        async move {
+            data_tx.send_serial(FromSerialData::Connect(
+                device.name().unwrap_or("Virtual".into()),
+            ));
+            let mut buf = [0; 128];
+            let mut se = SerialImpl {
+                data_tx,
+                device,
+                alive: true,
             };
+
+            while se.alive {
+                trace!("Serial waiting");
+                let read = se.device.read(&mut buf);
+                let write = event_rx.recv();
+                select!(
+                    e = read => {
+                        match e {
+                            Ok(bytes) => se.read(&buf[0..bytes]),
+                            Err(err) => se.data_tx.log(Error, format!("{}", err)),
+                        }
+                    }
+                    e = write => {
+                        if let Err(err) = se.write(e).await {
+                            se.data_tx.log(Error, format!("{}", err));
+                        }
+                    }
+                )
+            }
+
+            se.data_tx.send_serial(FromSerialData::Gone);
         }
-        data_tx.send_serial(FromSerialData::Gone);
-    });
+        .instrument(info_span!("Serial")),
+    );
 
     event_tx
 }
