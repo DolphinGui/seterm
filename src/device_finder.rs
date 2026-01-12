@@ -74,7 +74,6 @@ const STOPBITSS: [StopBits; 2] = [StopBits::One, StopBits::Two];
 const STOPBIT_STRS: [&str; 2] = ["1", "2"];
 
 pub struct DeviceFinder {
-    alive: bool,
     devices: Vec<SerialPortInfo>,
     state: ListState,
     tx: Option<oneshot::Sender<String>>,
@@ -102,7 +101,6 @@ impl DeviceFinder {
                 devices,
                 state: ListState::default(),
                 tx: Some(tx),
-                alive: true,
             },
             rx,
         ))
@@ -125,7 +123,7 @@ impl EventListener for DeviceFinder {
                 };
             }
             SerialDone => {
-                self.alive = false;
+                self.tx = None;
                 return false;
             }
             _ => return false,
@@ -167,7 +165,7 @@ impl Drawable for DeviceFinder {
         frame.render_stateful_widget(l, area, &mut self.state);
     }
     fn alive(&self) -> bool {
-        self.alive
+        self.tx.is_some()
     }
 }
 
@@ -196,7 +194,6 @@ impl DeviceConfig {
 }
 
 pub struct DeviceConfigurer {
-    alive: bool,
     config: DeviceConfig,
     table_state: TableState,
     tx: Option<oneshot::Sender<DeviceConfig>>,
@@ -228,7 +225,6 @@ impl DeviceConfigurer {
         let tx = Some(tx);
         (
             Self {
-                alive: true,
                 config: DeviceConfig::new(path, baud),
                 table_state: TableState::new(),
                 tx,
@@ -303,7 +299,7 @@ impl EventListener for DeviceConfigurer {
                 }
             }
             SerialDone => {
-                self.alive = false;
+                self.tx = None;
                 return false;
             }
             _ => {
@@ -373,6 +369,6 @@ impl Drawable for DeviceConfigurer {
     }
 
     fn alive(&self) -> bool {
-        self.alive
+        self.tx.is_some()
     }
 }
