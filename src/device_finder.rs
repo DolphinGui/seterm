@@ -3,18 +3,21 @@ use std::mem::take;
 use clap::ValueEnum;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
+    Frame,
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     style::{Style, Stylize},
     text::Text,
     widgets::{
-        Block, Borders, List, ListState, Paragraph, Row, StatefulWidget, Table, TableState, Widget,
+        Block, Borders, Clear, List, ListState, Paragraph, Row, StatefulWidget, Table, TableState,
+        Widget,
     },
 };
 use serialport::{DataBits, FlowControl, Parity, SerialPortInfo, StopBits};
 use tokio::sync::oneshot;
 
 use color_eyre::Result;
+use eyre::eyre;
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
 
 use crate::event::{Drawable, EventListener, GuiEvent};
@@ -79,15 +82,19 @@ pub struct DeviceFinder {
 
 impl DeviceFinder {
     pub fn new() -> Result<(DeviceFinder, oneshot::Receiver<String>)> {
-        let devices = tokio_serial::available_ports()?
+        let devices: Vec<_> = tokio_serial::available_ports()?
             .into_iter()
-            .filter(|i| match &i.port_type {
-                serialport::SerialPortType::UsbPort(_) => true,
-                serialport::SerialPortType::BluetoothPort => true,
-                _ => false,
+            .filter(|i| {
+                matches!(
+                    &i.port_type,
+                    serialport::SerialPortType::UsbPort(_)
+                        | serialport::SerialPortType::BluetoothPort
+                )
             })
             .collect();
-
+        if devices.is_empty() {
+            return Err(eyre!("Found no serial devices"));
+        }
         let (tx, rx) = oneshot::channel();
 
         Ok((
@@ -104,18 +111,22 @@ impl DeviceFinder {
 
 impl EventListener for DeviceFinder {
     fn listen(&mut self, e: &GuiEvent) -> bool {
-        use GuiEvent::Crossterm;
+        use GuiEvent::{Crossterm, Serial};
         use KeyCode::{Down, Enter, Up};
         use crossterm::event::Event::Key;
         match e {
             Crossterm(Key(KeyEvent { code: Up, .. })) => self.state.scroll_up_by(1),
             Crossterm(Key(KeyEvent { code: Down, .. })) => self.state.scroll_down_by(1),
             Crossterm(Key(KeyEvent { code: Enter, .. })) => {
-                if let Some(d) = self.state.selected().and_then(|i| self.devices.get(i)) {
-                    if let Some(tx) = self.tx.take() {
-                        tx.send(d.port_name.clone());
-                    }
+                if let Some(d) = self.state.selected().and_then(|i| self.devices.get(i))
+                    && let Some(tx) = self.tx.take()
+                {
+                    _ = tx.send(d.port_name.clone());
                 };
+            }
+            Serial(_) => {
+                self.alive = false;
+                return false;
             }
             _ => return false,
         };
@@ -140,7 +151,7 @@ fn format_device_info(info: &SerialPortInfo) -> String {
 }
 
 impl Drawable for DeviceFinder {
-    fn draw(&mut self, area: Rect, buf: &mut Buffer) {
+    fn draw(&mut self, area: Rect, frame: &mut Frame) {
         let text: Vec<_> = self
             .devices
             .iter()
@@ -151,7 +162,9 @@ impl Drawable for DeviceFinder {
         let l = List::new(text)
             .block(Block::bordered())
             .highlight_style(highlight_style);
-        <List as StatefulWidget>::render(l, area, buf, &mut self.state);
+
+        frame.render_widget(Clear, area);
+        frame.render_stateful_widget(l, area, &mut self.state);
     }
     fn alive(&self) -> bool {
         self.alive
@@ -270,10 +283,9 @@ impl DeviceConfigurer {
 
 impl EventListener for DeviceConfigurer {
     fn listen(&mut self, e: &GuiEvent) -> bool {
-        use GuiEvent::Crossterm;
+        use GuiEvent::{Crossterm, Serial};
         use KeyCode::{Down, Enter, Left, Right, Up};
         use crossterm::event::Event::Key;
-        let mut handled = true;
         match e {
             Crossterm(Key(KeyEvent { code: Up, .. })) => {
                 if self.table_state.selected().unwrap_or(0) <= 1 {
@@ -287,17 +299,23 @@ impl EventListener for DeviceConfigurer {
             Crossterm(Key(KeyEvent { code: Right, .. })) => self.select(1),
             Crossterm(Key(KeyEvent { code: Enter, .. })) => {
                 if let Some(tx) = self.tx.take() {
-                    tx.send(take(&mut self.config));
+                    _ = tx.send(take(&mut self.config));
                 }
             }
-            _ => handled = false,
+            Serial(_) => {
+                self.alive = false;
+                return false;
+            }
+            _ => {
+                return false;
+            }
         };
-        handled
+        true
     }
 }
 
 impl Drawable for DeviceConfigurer {
-    fn draw(&mut self, area: Rect, buf: &mut Buffer) {
+    fn draw(&mut self, area: Rect, frame: &mut Frame) {
         let [opt_area, desc_area] =
             &*Layout::vertical([Constraint::Percentage(80), Constraint::Percentage(20)])
                 .split(area)
@@ -342,14 +360,16 @@ impl Drawable for DeviceConfigurer {
             .block(Block::new().borders(Borders::all().difference(Borders::BOTTOM)))
             .row_highlight_style(Style::new().reversed());
 
-        <Table as StatefulWidget>::render(table, *opt_area, buf, &mut self.table_state);
+        frame.render_widget(Clear, area);
+        frame.render_stateful_widget(table, *opt_area, &mut self.table_state);
 
         let description = Paragraph::new(
             "Left/Right to change option\nUp/Down to select option\nEnter to connect\nEsc to exit",
         )
         .block(Block::new().borders(Borders::all().difference(Borders::TOP)))
         .centered();
-        description.render(*desc_area, buf);
+
+        frame.render_widget(description, *desc_area);
     }
 
     fn alive(&self) -> bool {

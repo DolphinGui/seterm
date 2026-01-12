@@ -4,6 +4,7 @@ use crate::event::{Drawable, EventListener, GuiEvent};
 
 use eyre::{Result, eyre};
 use ratatui::{
+    Frame,
     style::{Modifier, Style, Stylize},
     text::{Line, Span, Text},
     widgets::{Block, List, ListState, Paragraph, StatefulWidget, Widget},
@@ -88,12 +89,12 @@ impl FileViewer {
 }
 
 impl Drawable for FileViewer {
-    fn draw(&mut self, area: ratatui::prelude::Rect, buf: &mut ratatui::prelude::Buffer) {
+    fn draw(&mut self, area: ratatui::prelude::Rect, frame: &mut Frame) {
         let text = self.list_contents.iter().map(Text::raw);
         let list = List::new(text)
             .highlight_style(Style::default().reversed())
             .block(Block::bordered());
-        <List as StatefulWidget>::render(list, area, buf, &mut self.list_state);
+        frame.render_stateful_widget(list, area, &mut self.list_state);
     }
 
     fn alive(&self) -> bool {
@@ -156,13 +157,13 @@ impl CmdInput {
 }
 
 impl Drawable for CmdInput {
-    fn draw(&mut self, area: ratatui::prelude::Rect, buf: &mut ratatui::prelude::Buffer) {
+    fn draw(&mut self, area: ratatui::prelude::Rect, frame: &mut Frame) {
         let cursor = Span::raw("█").style(Style::default().add_modifier(Modifier::SLOW_BLINK));
         let line = Line::from(vec![Span::raw(&self.contents), cursor]);
-        Paragraph::new(Text::from(line))
+        let p = Paragraph::new(Text::from(line))
             .block(Block::bordered())
-            .left_aligned()
-            .render(area, buf);
+            .left_aligned();
+        frame.render_widget(p, area);
     }
 
     fn alive(&self) -> bool {

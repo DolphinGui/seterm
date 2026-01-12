@@ -7,7 +7,7 @@ use color_eyre::{
 use eyre::{Context, eyre};
 use futures::{FutureExt, StreamExt};
 use notify::{RecommendedWatcher, Watcher};
-use ratatui::{buffer::Buffer, crossterm::event::Event as CrosstermEvent, layout::Rect};
+use ratatui::{Frame, buffer::Buffer, crossterm::event::Event as CrosstermEvent, layout::Rect};
 use serialport::SerialPort;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -26,7 +26,7 @@ pub trait EventListener {
 
 pub trait Drawable {
     fn alive(&self) -> bool;
-    fn draw(&mut self, area: Rect, buf: &mut Buffer);
+    fn draw(&mut self, area: Rect, buf: &mut Frame);
 }
 
 pub trait Reactive: EventListener + Drawable + Send {}

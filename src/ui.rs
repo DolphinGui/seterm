@@ -1,6 +1,7 @@
 use std::mem::take;
 
 use ratatui::{
+    Frame,
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
@@ -30,22 +31,11 @@ struct Status {
     log: Vec<(Severity, String)>,
 }
 
+#[derive(Default)]
 struct TerminalStatus {
-    // should be using something like smol_string, which is immutable and may have better perf
-    // but for now we don't care
     text: Vec<String>,
     scroll_index: usize,
     scroll_state: ScrollbarState,
-}
-
-impl Default for TerminalStatus {
-    fn default() -> Self {
-        Self {
-            text: vec!["".into()],
-            scroll_index: Default::default(),
-            scroll_state: Default::default(),
-        }
-    }
 }
 
 fn is_char(m: crossterm::event::KeyModifiers) -> bool {
@@ -119,9 +109,14 @@ impl Dashboard {
         match se {
             FromSerialData::Data(items) => {
                 for line in String::from_utf8_lossy(items).split_inclusive('\n') {
-                    self.term_state.text.last_mut().unwrap().push_str(line);
-                    if line.ends_with('\n') {
-                        self.term_state.text.push(Default::default());
+                    match self.term_state.text.last_mut() {
+                        Some(l) if l.ends_with('\n') => {
+                            self.term_state.text.push(line.into());
+                        }
+                        Some(l) => {
+                            l.push_str(line);
+                        }
+                        None => self.term_state.text.push(line.into()),
                     }
                 }
             }
@@ -148,7 +143,7 @@ impl Drawable for Dashboard {
         self.alive
     }
     #[instrument(skip(frame))]
-    fn draw(&mut self, area: Rect, frame: &mut ratatui::prelude::Buffer) {
+    fn draw(&mut self, area: Rect, frame: &mut Frame) {
         trace!("Drawing dashboard");
         use ratatui::layout::Direction;
         let a = Layout::default()
@@ -168,12 +163,13 @@ impl Drawable for Dashboard {
             // really should not happen unless above fails somehow
             panic!("Layout should have 2 items only");
         };
+        let buf = frame.buffer_mut();
 
-        render_terminal_block(&mut self.term_state, *term, frame);
+        render_terminal_block(&mut self.term_state, *term, buf);
         trace!("Drawing terminal");
-        render_input_block(&self.term_input, *input, frame);
+        render_input_block(&self.term_input, *input, buf);
         trace!("Drawing input");
-        render_status_block(&self.status, *status_area, frame);
+        render_status_block(&self.status, *status_area, buf);
         trace!("Drawing status");
     }
 }

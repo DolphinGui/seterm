@@ -176,13 +176,10 @@ impl App {
         self.stack.retain(|i| i.alive());
         // first element is given more space than others
         // todo maybe consider having stuff store their own space?
-        self.stack
-            .first_mut()
-            .unwrap()
-            .draw(frame.area(), frame.buffer_mut());
+        self.stack.first_mut().unwrap().draw(frame.area(), frame);
         for component in &mut self.stack.iter_mut().skip(1) {
             trace!("Drawing popup!");
-            render_popup(component.as_mut(), frame.area(), frame.buffer_mut());
+            render_popup(component.as_mut(), frame.area(), frame);
         }
         trace!("Done Drawing");
     }
@@ -193,8 +190,7 @@ impl App {
         tokio::spawn(
             async move {
                 let r: Result<()> = async {
-                    let (finder, rx) =
-                        DeviceFinder::new().wrap_err("Could not list serial ports")?;
+                    let (finder, rx) = DeviceFinder::new()?;
                     app.new_component(Box::new(finder));
                     let Ok(path) = rx.await else { return Ok(()) };
                     let (popup, config) = DeviceConfigurer::new(path, baud);
@@ -266,7 +262,7 @@ impl App {
     }
 }
 
-fn render_popup(popup: &mut dyn Reactive, area: Rect, buf: &mut Buffer) {
+fn render_popup(popup: &mut dyn Reactive, area: Rect, buf: &mut Frame) {
     let x_margin = area.width / 4;
     let y_margin = area.height / 4;
     let area = area.inner(ratatui::layout::Margin {
