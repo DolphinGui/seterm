@@ -274,6 +274,10 @@ pub fn new_filewatcher(file: &Path, cmd: String, events: Messenger) -> Result<on
     let (killswitch, dead) = oneshot::channel();
     let mut watcher = notify::recommended_watcher(WatcherImpl(tx))?;
     watcher.watch(file, notify::RecursiveMode::Recursive)?;
+    let cmd = cmd.replace(
+        "#BIN#",
+        file.to_str().ok_or_eyre("Unable to parse binary path")?,
+    );
     let cmd = shlex::split(&cmd).ok_or_eyre("Unable to parse command")?;
     tokio::spawn(async {
         UploaderImpl {
@@ -297,9 +301,18 @@ impl UploaderImpl {
             .output()
             .await
             .wrap_err("Unable to execute command")?;
+        let severity = if out.status.success() {
+            Severity::Info
+        } else {
+            Severity::Error
+        };
         self.to_dash.log(
-            Severity::Info,
-            format!("{}: {}", String::from_utf8_lossy(&out.stdout), out.status),
+            severity,
+            format!(
+                "UPLOAD {}: {}",
+                out.status.code().unwrap_or(0),
+                String::from_utf8_lossy(&out.stdout)
+            ),
         );
         if !out.stderr.is_empty() {
             self.to_dash.log(
