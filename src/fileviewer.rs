@@ -1,15 +1,15 @@
 use std::{fs::DirEntry, mem::take, path::PathBuf};
 
-use crate::event::{Drawable, EventListener, GuiEvent};
+use crate::event::{Drawable, EventListener, GuiEvent, Messenger, Severity, ToAppEvent};
 
-use eyre::{Result, eyre};
+use eyre::{OptionExt, Result, eyre};
 use ratatui::{
     Frame,
     style::{Modifier, Style, Stylize},
     text::{Line, Span, Text},
     widgets::{Block, List, ListState, Paragraph, StatefulWidget, Widget},
 };
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 pub struct FileViewer {
     cur_dir: PathBuf,
@@ -17,10 +17,11 @@ pub struct FileViewer {
     list_contents: Vec<String>,
     list_state: ListState,
     tx: Option<oneshot::Sender<PathBuf>>,
+    to_app: Messenger,
 }
 
 impl FileViewer {
-    pub fn new() -> Result<(FileViewer, oneshot::Receiver<PathBuf>)> {
+    pub fn new(to_app: Messenger) -> Result<(FileViewer, oneshot::Receiver<PathBuf>)> {
         let cur_dir =
             std::env::current_dir().map_err(|e| eyre!("Error reading current directory: {}", e))?;
         let contents: Vec<DirEntry> = cur_dir.read_dir()?.filter_map(|r| r.ok()).collect();
@@ -44,6 +45,7 @@ impl FileViewer {
                 list_contents,
                 list_state: ListState::default(),
                 tx,
+                to_app,
             },
             rx,
         ))
@@ -58,16 +60,21 @@ impl FileViewer {
         )
     }
 
-    fn handle_file(&mut self, sel: usize) -> Result<()> {
+    fn handle_file(&mut self) -> Result<()> {
+        let sel = self.list_state.selected().ok_or_eyre("No item selected")?;
         let f = self.contents[sel].path();
         // specifically chooses to traverse symlinks
         let m = std::fs::metadata(&f)?;
         if m.is_dir() {
             self.update_dir(f)?;
+            Ok(())
         } else {
-            todo!();
+            self.tx
+                .take()
+                .map(|t| t.send(f).map_err(|_| eyre!("Could not send file")))
+                .ok_or_eyre("File handling error")
+                .flatten()
         }
-        Ok(())
     }
 
     fn update_dir(&mut self, path: PathBuf) -> Result<()> {
@@ -110,31 +117,27 @@ impl EventListener for FileViewer {
             KeyCode::{Down, Enter, Left, Right, Up},
             KeyEvent,
         };
-        match e {
-            Crossterm(Key(KeyEvent { code: Left, .. })) => todo!(),
+        let r = match e {
+            Crossterm(Key(KeyEvent { code: Left, .. })) => self.go_parent(),
             Crossterm(Key(KeyEvent {
                 code: Right | Enter,
                 ..
-            })) => {
-                let Some(selected) = self.list_state.selected() else {
-                    return false;
-                };
-                let selected = &self.contents[selected];
-                if let Some(tx) = self.tx.take() {
-                    tx.send(selected.path());
-                }
-                true
-            }
+            })) => self.handle_file(),
             Crossterm(Key(KeyEvent { code: Up, .. })) => {
                 self.list_state.select_previous();
-                true
+                Ok(())
             }
             Crossterm(Key(KeyEvent { code: Down, .. })) => {
                 self.list_state.select_next();
-                true
+                Ok(())
             }
-            _ => false,
+            _ => return false,
+        };
+        if let Err(e) = r {
+            self.to_app
+                .log(Severity::Error, format!("Could not select file: {}", e));
         }
+        return true;
     }
 }
 

@@ -229,7 +229,7 @@ impl App {
         let to_dash = self.to_self.clone();
         tokio::spawn(
             async move {
-                let Ok((finder, f)) = FileViewer::new() else {
+                let Ok((finder, f)) = FileViewer::new(to_dash.clone()) else {
                     to_dash.log(Severity::Error, "Could not open working directory".into());
                     return;
                 };
