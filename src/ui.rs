@@ -1,36 +1,19 @@
-use std::{mem::take, process::Output};
+use std::mem::take;
 
-use eyre::OptionExt;
-use futures::future::{select, try_select};
 use ratatui::{
-    Frame,
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
-    text::{Line, Span, StyledGrapheme, Text},
+    text::{Line, Span, Text},
     widgets::{
         Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget,
     },
 };
-use tokio::{
-    select,
-    sync::{
-        mpsc::{self, UnboundedSender},
-        oneshot,
-    },
-};
+use tracing::{instrument, trace};
 
-use crate::{
-    device_finder::{Baud, DeviceConfigurer, DeviceFinder},
-    event::{
-        Drawable, EventListener, FromSerialData, GuiEvent, Messenger, Severity, ToAppEvent,
-        ToSerialData, new_filewatcher, serial_handler,
-    },
-    fileviewer::{CmdInput, FileViewer},
-};
+use crate::event::{Drawable, EventListener, FromSerialData, GuiEvent, Messenger, Severity};
 
-use color_eyre::{Result, eyre::WrapErr};
-
+#[derive(Debug)]
 pub struct Dashboard {
     alive: bool,
     term_input: String,
@@ -39,7 +22,7 @@ pub struct Dashboard {
     to_app: Messenger,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Status {
     cts: bool,
     dtr: bool,
@@ -47,7 +30,6 @@ struct Status {
     log: Vec<(Severity, String)>,
 }
 
-#[derive(Debug)]
 struct TerminalStatus {
     // should be using something like smol_string, which is immutable and may have better perf
     // but for now we don't care
@@ -165,8 +147,9 @@ impl Drawable for Dashboard {
     fn alive(&self) -> bool {
         self.alive
     }
-
+    #[instrument(skip(frame))]
     fn draw(&mut self, area: Rect, frame: &mut ratatui::prelude::Buffer) {
+        trace!("Drawing dashboard");
         use ratatui::layout::Direction;
         let a = Layout::default()
             .direction(Direction::Horizontal)
@@ -187,8 +170,11 @@ impl Drawable for Dashboard {
         };
 
         render_terminal_block(&mut self.term_state, *term, frame);
+        trace!("Drawing terminal");
         render_input_block(&self.term_input, *input, frame);
+        trace!("Drawing input");
         render_status_block(&self.status, *status_area, frame);
+        trace!("Drawing status");
     }
 }
 
@@ -261,4 +247,25 @@ fn render_terminal_block(input: &mut TerminalStatus, area: Rect, frame: &mut Buf
     block.render(area, frame);
     let lines = input.text.iter().rev().skip(input.scroll_index);
     render_log(lines, text_area, frame);
+}
+
+impl std::fmt::Debug for TerminalStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalStatus")
+            .field("text_size", &self.text.len())
+            .field("scroll_index", &self.scroll_index)
+            .field("scroll_state", &self.scroll_state)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Status")
+            .field("cts", &self.cts)
+            .field("dtr", &self.dtr)
+            .field("device", &self.device)
+            .field("log_size", &self.log.len())
+            .finish()
+    }
 }

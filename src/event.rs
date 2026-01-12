@@ -1,11 +1,11 @@
-use std::{path::Path, process::ExitStatus, time::Duration};
+use std::{path::Path, time::Duration};
 
 use color_eyre::{
     Report, Result,
     eyre::{self, OptionExt},
 };
 use eyre::{Context, eyre};
-use futures::{FutureExt, StreamExt, channel::mpsc::UnboundedSender};
+use futures::{FutureExt, StreamExt};
 use notify::{RecommendedWatcher, Watcher};
 use ratatui::{buffer::Buffer, crossterm::event::Event as CrosstermEvent, layout::Rect};
 use serialport::SerialPort;
@@ -88,7 +88,7 @@ pub enum FromFileWatcher {
     ReconnectRequest,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Messenger(mpsc::UnboundedSender<ToAppEvent>);
 
 impl Messenger {
@@ -129,7 +129,7 @@ pub fn crossterm_handler(to_app: Messenger) {
                 if to_app.is_closed() {
                     break;
                 }
-                let _ = to_app.send_term(evt);
+                to_app.send_term(evt);
             }
         }
     });

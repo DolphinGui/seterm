@@ -1,7 +1,7 @@
 use std::mem::take;
 
 use clap::ValueEnum;
-use crossterm::event::{Event, KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},

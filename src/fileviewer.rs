@@ -1,6 +1,6 @@
 use std::{fs::DirEntry, mem::take, path::PathBuf};
 
-use crate::event::{AppEvent, Drawable, EventListener, GuiEvent, ToAppEvent};
+use crate::event::{Drawable, EventListener, GuiEvent};
 
 use eyre::{Result, eyre};
 use ratatui::{
@@ -8,7 +8,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, List, ListState, Paragraph, StatefulWidget, Widget},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 pub struct FileViewer {
     cur_dir: PathBuf,
