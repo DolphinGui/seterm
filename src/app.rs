@@ -1,8 +1,9 @@
 use crate::{
     device_finder::{Baud, DeviceConfig, DeviceConfigurer, DeviceFinder},
     event::{
-        AppEvent, FromFileWatcher, GuiEvent, Messenger, Reactive, Severity, ToAppEvent,
-        ToSerialData, crossterm_handler, new_filewatcher, serial_handler,
+        AppEvent, FromFileWatcher, FromSerialData, GuiEvent, Messenger, Reactive, Severity,
+        ToAppEvent, ToFileWatcher, ToSerialData, crossterm_handler, new_filewatcher,
+        serial_handler,
     },
     fileviewer::{CmdInput, FileViewer},
     ui::Dashboard,
@@ -10,10 +11,10 @@ use crate::{
 
 use crossterm::event::KeyEvent;
 use eyre::OptionExt;
-use ratatui::{DefaultTerminal, Frame, buffer::Buffer, layout::Rect};
+use ratatui::{DefaultTerminal, Frame, layout::Rect};
 
 use color_eyre::{Result, eyre::WrapErr};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tracing::{Instrument, instrument, trace};
 
 pub struct App {
@@ -23,7 +24,7 @@ pub struct App {
     stack: Vec<Box<dyn Reactive>>,
     serial: Option<mpsc::UnboundedSender<ToSerialData>>,
     serial_cfg: Option<DeviceConfig>,
-    uploader: Option<oneshot::Sender<()>>,
+    watcher: Option<mpsc::UnboundedSender<ToFileWatcher>>,
 }
 
 impl std::fmt::Debug for App {
@@ -33,7 +34,7 @@ impl std::fmt::Debug for App {
             .field("inbox", &self.inbox)
             .field("serial", &self.serial)
             .field("serial_cfg", &self.serial_cfg)
-            .field("uploader", &self.uploader)
+            .field("uploader", &self.watcher)
             .finish()
     }
 }
@@ -56,7 +57,7 @@ impl App {
             stack: vec![Box::new(Dashboard::new(tx))],
             serial: None,
             serial_cfg: None,
-            uploader: None,
+            watcher: None,
         }
     }
     #[instrument(skip(terminal))]
@@ -76,6 +77,12 @@ impl App {
         while self.running {
             terminal.draw(|frame| self.draw(frame))?;
             match self.next().await? {
+                Gui(GuiEvent::Serial(FromSerialData::Gone)) => {
+                    self.watcher
+                        .as_mut()
+                        .inspect(|u| _ = u.send(ToFileWatcher::Disconnected));
+                    self.handle_key_events(GuiEvent::Serial(FromSerialData::Gone));
+                }
                 Gui(g) => self.handle_key_events(g),
                 App(Leave) => {
                     _ = self.stack.pop();
@@ -94,7 +101,7 @@ impl App {
                     self.serial_cfg = Some(c);
                 }
                 App(SendUpload(u)) => {
-                    self.uploader = Some(u);
+                    self.watcher = Some(u);
                 }
                 App(Watcher(w)) => self.handle_watcher(w),
                 Popup(reactive) => self.stack.push(reactive),
@@ -145,14 +152,15 @@ impl App {
     fn handle_watcher(&mut self, w: FromFileWatcher) {
         match w {
             FromFileWatcher::DisonnectRequest => {
-                if self.serial.is_none() {
+                let Some(se) = self.serial.as_mut() else {
                     self.to_self.log(
                         Severity::Error,
                         "Cannot flash when no device is connected".into(),
                     );
-                    self.uploader.take().map(|u| u.send(()));
-                }
-                self.serial = None;
+                    _ = self.watcher.as_mut().unwrap().send(ToFileWatcher::NoDevice);
+                    return;
+                };
+                _ = se.send(ToSerialData::Disconnect);
             }
             FromFileWatcher::ReconnectRequest => {
                 let cfg = self.serial_cfg.clone().unwrap();

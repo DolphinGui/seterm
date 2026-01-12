@@ -61,7 +61,7 @@ pub enum AppEvent {
     SerialConnect(mpsc::UnboundedSender<ToSerialData>, DeviceConfig),
     SendSerial(ToSerialData),
     RequestUpload,
-    SendUpload(oneshot::Sender<()>),
+    SendUpload(mpsc::UnboundedSender<ToFileWatcher>),
     Watcher(FromFileWatcher),
     Leave,
     Quit,
@@ -86,6 +86,12 @@ pub enum FromSerialData {
 pub enum FromFileWatcher {
     DisonnectRequest,
     ReconnectRequest,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ToFileWatcher {
+    Disconnected,
+    NoDevice,
 }
 
 #[derive(Clone, Debug)]
@@ -265,13 +271,18 @@ struct UploaderImpl {
     _watcher: RecommendedWatcher,
     events: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
     to_dash: Messenger,
-    deadman: oneshot::Receiver<()>,
+    from_app: mpsc::UnboundedReceiver<ToFileWatcher>,
     cmd: Vec<String>,
+    alive: bool,
 }
 
-pub fn new_filewatcher(file: &Path, cmd: String, events: Messenger) -> Result<oneshot::Sender<()>> {
+pub fn new_filewatcher(
+    file: &Path,
+    cmd: String,
+    events: Messenger,
+) -> Result<mpsc::UnboundedSender<ToFileWatcher>> {
     let (tx, rx) = mpsc::unbounded_channel();
-    let (killswitch, dead) = oneshot::channel();
+    let (to_watcher, from_app) = mpsc::unbounded_channel();
     let mut watcher = notify::recommended_watcher(WatcherImpl(tx))?;
     watcher.watch(file, notify::RecursiveMode::Recursive)?;
     let cmd = cmd.replace(
@@ -280,21 +291,61 @@ pub fn new_filewatcher(file: &Path, cmd: String, events: Messenger) -> Result<on
     );
     let cmd = shlex::split(&cmd).ok_or_eyre("Unable to parse command")?;
     tokio::spawn(async {
-        UploaderImpl {
+        let mut u = UploaderImpl {
             _watcher: watcher,
             events: rx,
             to_dash: events,
             cmd,
-            deadman: dead,
+            from_app,
+            alive: true,
+        };
+        while u.alive {
+            u.run().await;
         }
-        .run()
-        .await;
     });
 
-    Ok(killswitch)
+    Ok(to_watcher)
 }
 
 impl UploaderImpl {
+    async fn run(&mut self) {
+        use notify::EventKind::{Any, Create, Modify};
+        if self.from_app.is_closed() {
+            return;
+        }
+        match self.events.recv().await.unwrap() {
+            Ok(notify::Event {
+                kind: Any | Create(..) | Modify(..),
+                ..
+            }) => {
+                self.upload().await;
+            }
+            Err(e) => self
+                .to_dash
+                .log(Severity::Error, format!("Error watching file: {}", e)),
+            _ => {}
+        };
+    }
+
+    async fn upload(&mut self) {
+        self.to_dash.send_file(FromFileWatcher::DisonnectRequest);
+        // await for disconnect to finish;
+        match self.from_app.recv().await {
+            Some(ToFileWatcher::Disconnected) => {}
+            Some(ToFileWatcher::NoDevice) => {
+                return;
+            }
+            None => {
+                self.alive = false;
+                return;
+            }
+        }
+        if let Err(e) = self.exec().await {
+            self.to_dash.log(Severity::Error, e.to_string())
+        }
+        self.to_dash.send_file(FromFileWatcher::ReconnectRequest);
+    }
+
     async fn exec(&self) -> Result<()> {
         let out = tokio::process::Command::new(&self.cmd[0])
             .args(&self.cmd[1..])
@@ -321,28 +372,5 @@ impl UploaderImpl {
             );
         }
         Ok(())
-    }
-
-    async fn run(&mut self) {
-        use notify::EventKind::{Any, Create, Modify};
-        loop {
-            if self.deadman.try_recv().is_ok() {
-                return;
-            }
-            match self.events.recv().await.unwrap() {
-                Ok(notify::Event {
-                    kind: Any | Create(..) | Modify(..),
-                    ..
-                }) => {
-                    if let Err(e) = self.exec().await {
-                        self.to_dash.log(Severity::Error, e.to_string())
-                    }
-                }
-                Err(e) => self
-                    .to_dash
-                    .log(Severity::Error, format!("Error watching file: {}", e)),
-                _ => {}
-            };
-        }
     }
 }
