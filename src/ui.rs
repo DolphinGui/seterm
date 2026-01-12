@@ -1,55 +1,218 @@
-use color_eyre::owo_colors::OwoColorize;
+use std::{mem::take, process::Output};
+
+use eyre::OptionExt;
+use futures::future::{select, try_select};
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span, StyledGrapheme, Text},
-    widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation},
+    widgets::{
+        Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget,
+    },
+};
+use tokio::{
+    select,
+    sync::{
+        mpsc::{self, UnboundedSender},
+        oneshot,
+    },
 };
 
 use crate::{
-    app::{App, Status, TerminalStatus},
-    device_finder::Reactive,
+    device_finder::{Baud, DeviceConfigurer, DeviceFinder},
+    event::{
+        Drawable, EventListener, FromSerialData, GuiEvent, Messenger, Severity, ToAppEvent,
+        ToSerialData, new_filewatcher, serial_handler,
+    },
+    fileviewer::{CmdInput, FileViewer},
 };
 
-fn render_input_block(input: &str, area: Rect, frame: &mut Frame) {
-    let cursor = Span::raw("█").style(Style::default().add_modifier(Modifier::SLOW_BLINK));
-    let line = Line::from(vec![Span::raw(input), cursor]);
-    let paragraph = Paragraph::new(Text::from(line))
-        .block(Block::bordered())
-        .left_aligned();
-    frame.render_widget(paragraph, area);
+use color_eyre::{Result, eyre::WrapErr};
+
+pub struct Dashboard {
+    alive: bool,
+    term_input: String,
+    term_state: TerminalStatus,
+    status: Status,
+    to_app: Messenger,
 }
 
-fn render_log<'a, T: Iterator>(lines: T, area: Rect, frame: &mut Frame)
-where
-    std::borrow::Cow<'a, str>: std::convert::From<<T as std::iter::Iterator>::Item>,
-    <T as std::iter::Iterator>::Item: std::fmt::Display,
-{
-    let lines = lines.enumerate().take((area.height).into());
-    let buf = frame.buffer_mut();
-    for (lineno, line) in lines {
-        let line = Line::raw(line);
-        for (
-            x,
-            StyledGrapheme {
-                style: s,
-                symbol: g,
-            },
-        ) in line.styled_graphemes(Style::default()).enumerate()
-        {
-            let x = (x as u16).saturating_add(area.x);
-            let y = area.height + area.y - (lineno as u16 + 1);
-            let Some(cell) = buf.cell_mut((x, y)) else {
-                break;
-            };
-            cell.set_style(s);
-            cell.set_symbol(g);
+#[derive(Debug, Default)]
+struct Status {
+    cts: bool,
+    dtr: bool,
+    device: String,
+    log: Vec<(Severity, String)>,
+}
+
+#[derive(Debug)]
+struct TerminalStatus {
+    // should be using something like smol_string, which is immutable and may have better perf
+    // but for now we don't care
+    text: Vec<String>,
+    scroll_index: usize,
+    scroll_state: ScrollbarState,
+}
+
+impl Default for TerminalStatus {
+    fn default() -> Self {
+        Self {
+            text: vec!["".into()],
+            scroll_index: Default::default(),
+            scroll_state: Default::default(),
         }
     }
 }
 
-fn render_status_block(stat: &Status, area: Rect, frame: &mut Frame) {
+fn is_char(m: crossterm::event::KeyModifiers) -> bool {
+    m.difference(crossterm::event::KeyModifiers::SHIFT)
+        .is_empty()
+}
+
+impl EventListener for Dashboard {
+    fn listen(&mut self, e: &GuiEvent) -> bool {
+        use GuiEvent::{Crossterm, Log, Serial};
+        match e {
+            Log(sev, st) => {
+                self.status.log.push((*sev, st.clone()));
+                true
+            }
+            Crossterm(c) => self.handle_term(c),
+            Serial(s) => self.handle_serial(s),
+        }
+    }
+}
+
+impl Dashboard {
+    pub fn new(to_app: Messenger) -> Self {
+        Self {
+            alive: true,
+            term_input: Default::default(),
+            term_state: Default::default(),
+            status: Default::default(),
+            to_app,
+        }
+    }
+
+    fn handle_term(&mut self, e: &crossterm::event::Event) -> bool {
+        use crossterm::event::{
+            Event::Key,
+            KeyCode::{Backspace, Char, Enter},
+            KeyEvent,
+        };
+        match e {
+            Key(KeyEvent {
+                code: Char(c),
+                modifiers,
+                ..
+            }) if is_char(*modifiers) => {
+                self.term_input.push(*c);
+            }
+
+            Key(KeyEvent {
+                code: Backspace,
+                modifiers,
+                ..
+            }) if modifiers.is_empty() => {
+                _ = self.term_input.pop();
+            }
+            Key(KeyEvent {
+                code: Enter,
+                modifiers,
+                ..
+            }) if modifiers.is_empty() => {
+                self.term_input.push('\n');
+                self.send_serial();
+            }
+            _ => {
+                return false;
+            }
+        };
+        true
+    }
+
+    fn handle_serial(&mut self, se: &FromSerialData) -> bool {
+        match se {
+            FromSerialData::Data(items) => {
+                for line in String::from_utf8_lossy(items).split_inclusive('\n') {
+                    self.term_state.text.last_mut().unwrap().push_str(line);
+                    if line.ends_with('\n') {
+                        self.term_state.text.push(Default::default());
+                    }
+                }
+            }
+            FromSerialData::Status { dtr, cts } => {
+                self.status.dtr = *dtr;
+                self.status.cts = *cts;
+            }
+            FromSerialData::Connect(s) => self.status.device = s.clone(),
+            FromSerialData::Gone => self.status.device.clear(),
+        };
+        true
+    }
+
+    fn send_serial(&mut self) {
+        use crate::event::{AppEvent::SendSerial, ToSerialData::Data};
+        _ = self
+            .to_app
+            .send_app(SendSerial(Data(take(&mut self.term_input))));
+    }
+}
+
+impl Drawable for Dashboard {
+    fn alive(&self) -> bool {
+        self.alive
+    }
+
+    fn draw(&mut self, area: Rect, frame: &mut ratatui::prelude::Buffer) {
+        use ratatui::layout::Direction;
+        let a = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(70), Constraint::Min(20)])
+            .split(area);
+        let [bigger, status_area] = &*a else {
+            panic!("Bigger area should have 1 item");
+        };
+
+        let left_area = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(90), Constraint::Min(1)])
+            .split(*bigger);
+
+        let [term, input] = &*left_area else {
+            // really should not happen unless above fails somehow
+            panic!("Layout should have 2 items only");
+        };
+
+        render_terminal_block(&mut self.term_state, *term, frame);
+        render_input_block(&self.term_input, *input, frame);
+        render_status_block(&self.status, *status_area, frame);
+    }
+}
+
+fn render_input_block(input: &str, area: Rect, frame: &mut Buffer) {
+    let cursor = Span::raw("█").style(Style::default().add_modifier(Modifier::SLOW_BLINK));
+    let line = Line::from(vec![Span::raw(input), cursor]);
+    Paragraph::new(Text::from(line))
+        .block(Block::bordered())
+        .left_aligned()
+        .render(area, frame);
+}
+
+fn render_log<T: Iterator>(lines: T, area: Rect, buf: &mut Buffer)
+where
+    <T as std::iter::Iterator>::Item: ratatui::widgets::Widget,
+{
+    let rows = area.rows().rev();
+    let lines = lines.zip(rows).take((area.height).into());
+    for (text, row) in lines {
+        text.render(row, buf);
+    }
+}
+
+fn render_status_block(stat: &Status, area: Rect, frame: &mut Buffer) {
     let [stats, log_area] =
         &*Layout::vertical([Constraint::Percentage(30), Constraint::Percentage(70)]).split(area)
     else {
@@ -63,67 +226,39 @@ fn render_status_block(stat: &Status, area: Rect, frame: &mut Frame) {
 
     let log_block = Block::bordered();
     let log_zone = log_block.inner(*log_area);
-    frame.render_widget(log_block, *log_area);
-    let lines = stat.log.iter().rev();
+    log_block.render(*log_area, frame);
+    let lines = stat
+        .log
+        .iter()
+        .rev()
+        .map(|(sev, str)| render_text(*sev, str));
     render_log(lines, log_zone, frame);
 
     let status = format!("CTS: {}\nDTR: {}\nConnected: {}", cts, dtr, stat.device,);
 
     let status_block = Paragraph::new(status).block(Block::bordered()).centered();
-    frame.render_widget(status_block, *stats);
+    status_block.render(*stats, frame);
 }
 
-fn render_terminal_block(input: &mut TerminalStatus, area: Rect, frame: &mut Frame) {
+fn render_text(sev: Severity, t: &str) -> Text<'_> {
+    let color = match sev {
+        Severity::Error => ratatui::style::Color::Red,
+        Severity::Info => ratatui::style::Color::default(),
+        Severity::Debug => ratatui::style::Color::LightGreen,
+    };
+    Text::styled(t, Style::new().fg(color))
+}
+
+fn render_terminal_block(input: &mut TerminalStatus, area: Rect, frame: &mut Buffer) {
     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight).thumb_symbol("#");
     input.scroll_state = input
         .scroll_state
         .content_length(input.text.len())
         .position(input.text.len() - input.scroll_index);
-    frame.render_stateful_widget(scrollbar, area, &mut input.scroll_state);
+    <Scrollbar as StatefulWidget>::render(scrollbar, area, frame, &mut input.scroll_state);
     let block = Block::bordered();
     let text_area = block.inner(area);
-    frame.render_widget(block, area);
+    block.render(area, frame);
     let lines = input.text.iter().rev().skip(input.scroll_index);
     render_log(lines, text_area, frame);
-}
-
-fn render_popup(popup: &mut dyn Reactive, area: Rect, frame: &mut Frame) {
-    let x_margin = area.width / 4;
-    let y_margin = area.height / 4;
-    let area = area.inner(ratatui::layout::Margin {
-        horizontal: x_margin,
-        vertical: y_margin,
-    });
-
-    let buf = frame.buffer_mut();
-    popup.draw(area, buf);
-}
-
-pub fn render_ui(state: &mut App, frame: &mut Frame) {
-    use ratatui::layout::Direction;
-    let area = frame.area();
-    let a = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(70), Constraint::Min(20)])
-        .split(area);
-    let [bigger, status_area] = &*a else {
-        panic!("Bigger area should have 1 item");
-    };
-
-    let left_area = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(90), Constraint::Min(1)])
-        .split(*bigger);
-
-    let [term, input] = &*left_area else {
-        // really should not happen unless above fails somehow
-        panic!("Layout should have 2 items only");
-    };
-
-    render_terminal_block(&mut state.term_state, *term, frame);
-    render_input_block(&state.term_input, *input, frame);
-    render_status_block(&state.status, *status_area, frame);
-    if let Some(popup) = state.popup.as_mut() {
-        render_popup(popup.as_mut(), area, frame);
-    }
 }

@@ -1,3 +1,5 @@
+use std::mem::take;
+
 use clap::ValueEnum;
 use crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::{
@@ -10,28 +12,12 @@ use ratatui::{
     },
 };
 use serialport::{DataBits, FlowControl, Parity, SerialPortInfo, StopBits};
-use tokio::sync::mpsc;
-use tokio_serial::SerialPortBuilderExt;
+use tokio::sync::oneshot;
 
-use crate::event::{AppEvent, ToAppMsg};
+use color_eyre::Result;
+use tokio_serial::{SerialPortBuilderExt, SerialStream};
 
-pub trait EventListener {
-    fn listen(&mut self, e: Event) -> bool;
-}
-
-pub trait Drawable {
-    fn draw(&mut self, area: Rect, buf: &mut Buffer);
-}
-
-pub trait Reactive: EventListener + Drawable {}
-
-impl<T> Reactive for T where T: EventListener + Drawable {}
-
-pub struct DeviceFinder {
-    devices: Vec<SerialPortInfo>,
-    state: ListState,
-    to_app: mpsc::UnboundedSender<ToAppMsg>,
-}
+use crate::event::{Drawable, EventListener, GuiEvent};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Baud {
@@ -84,49 +70,56 @@ const PARITY_STRS: [&str; 3] = ["None", "Odd", "Even"];
 const STOPBITSS: [StopBits; 2] = [StopBits::One, StopBits::Two];
 const STOPBIT_STRS: [&str; 2] = ["1", "2"];
 
-pub struct DeviceConfigurer {
-    table_state: TableState,
-    path: String,
-    baud: Baud,
-    bits: DataBits,
-    flow: FlowControl,
-    parity: Parity,
-    stop: StopBits,
-    dtr: bool,
-    to_app: mpsc::UnboundedSender<ToAppMsg>,
+pub struct DeviceFinder {
+    alive: bool,
+    devices: Vec<SerialPortInfo>,
+    state: ListState,
+    tx: Option<oneshot::Sender<String>>,
 }
 
 impl DeviceFinder {
-    pub fn new(
-        devices: Vec<SerialPortInfo>,
-        to_app: mpsc::UnboundedSender<ToAppMsg>,
-    ) -> DeviceFinder {
-        Self {
-            devices,
-            state: ListState::default(),
-            to_app,
-        }
+    pub fn new() -> Result<(DeviceFinder, oneshot::Receiver<String>)> {
+        let devices = tokio_serial::available_ports()?
+            .into_iter()
+            .filter(|i| match &i.port_type {
+                serialport::SerialPortType::UsbPort(_) => true,
+                serialport::SerialPortType::BluetoothPort => true,
+                _ => false,
+            })
+            .collect();
+
+        let (tx, rx) = oneshot::channel();
+
+        Ok((
+            Self {
+                devices,
+                state: ListState::default(),
+                tx: Some(tx),
+                alive: true,
+            },
+            rx,
+        ))
     }
 }
 
 impl EventListener for DeviceFinder {
-    fn listen(&mut self, e: Event) -> bool {
-        use Event::Key;
+    fn listen(&mut self, e: &GuiEvent) -> bool {
+        use GuiEvent::Crossterm;
         use KeyCode::{Down, Enter, Up};
-        let mut handled = true;
+        use crossterm::event::Event::Key;
         match e {
-            Key(KeyEvent { code: Up, .. }) => self.state.scroll_up_by(1),
-            Key(KeyEvent { code: Down, .. }) => self.state.scroll_down_by(1),
-            Key(KeyEvent { code: Enter, .. }) => {
+            Crossterm(Key(KeyEvent { code: Up, .. })) => self.state.scroll_up_by(1),
+            Crossterm(Key(KeyEvent { code: Down, .. })) => self.state.scroll_down_by(1),
+            Crossterm(Key(KeyEvent { code: Enter, .. })) => {
                 if let Some(d) = self.state.selected().and_then(|i| self.devices.get(i)) {
-                    _ = self
-                        .to_app
-                        .send(ToAppMsg::App(AppEvent::SelectDevice(d.port_name.clone())));
+                    if let Some(tx) = self.tx.take() {
+                        tx.send(d.port_name.clone());
+                    }
                 };
             }
-            _ => handled = false,
+            _ => return false,
         };
-        handled
+        true
     }
 }
 
@@ -154,40 +147,93 @@ impl Drawable for DeviceFinder {
             .map(format_device_info)
             .map(Text::raw)
             .collect();
-        let
-          highlight_style = Style::default().reversed();
+        let highlight_style = Style::default().reversed();
         let l = List::new(text)
             .block(Block::bordered())
             .highlight_style(highlight_style);
         <List as StatefulWidget>::render(l, area, buf, &mut self.state);
     }
+    fn alive(&self) -> bool {
+        self.alive
+    }
 }
 
-impl DeviceConfigurer {
-    pub fn new(path: String, to_app: mpsc::UnboundedSender<ToAppMsg>, baud: Baud) -> Self {
+#[derive(Clone, Debug)]
+pub struct DeviceConfig {
+    path: String,
+    baud: Baud,
+    bits: DataBits,
+    flow: FlowControl,
+    parity: Parity,
+    stop: StopBits,
+    dtr: bool,
+}
+
+impl DeviceConfig {
+    pub fn to_serial(self) -> Result<SerialStream> {
+        tokio_serial::new(self.path, self.baud as u32)
+            .data_bits(self.bits)
+            .flow_control(self.flow)
+            .parity(self.parity)
+            .stop_bits(self.stop)
+            .dtr_on_open(self.dtr)
+            .open_native_async()
+            .map_err(|e| e.into())
+    }
+}
+
+pub struct DeviceConfigurer {
+    alive: bool,
+    config: DeviceConfig,
+    table_state: TableState,
+    tx: Option<oneshot::Sender<DeviceConfig>>,
+}
+
+impl Default for DeviceConfig {
+    fn default() -> Self {
+        Self::new(String::default(), Baud::B1152)
+    }
+}
+
+impl DeviceConfig {
+    fn new(path: String, baud: Baud) -> Self {
         Self {
             path,
-            table_state: TableState::new(),
             baud,
             bits: DataBits::Eight,
             flow: FlowControl::None,
             parity: Parity::None,
             stop: StopBits::One,
             dtr: true,
-            to_app,
         }
+    }
+}
+
+impl DeviceConfigurer {
+    pub fn new(path: String, baud: Baud) -> (Self, oneshot::Receiver<DeviceConfig>) {
+        let (tx, rx) = oneshot::channel();
+        let tx = Some(tx);
+        (
+            Self {
+                alive: true,
+                config: DeviceConfig::new(path, baud),
+                table_state: TableState::new(),
+                tx,
+            },
+            rx,
+        )
     }
 
     fn select(&mut self, inc: isize) {
         let col = self.table_state.selected().unwrap_or(1) - 1;
         let index = match col {
-            0 => baud_idx(self.baud),
-            1 => self.bits as isize,
-            2 => self.flow as isize,
-            3 => self.parity as isize,
-            4 => self.stop as isize,
+            0 => baud_idx(self.config.baud),
+            1 => self.config.bits as isize,
+            2 => self.config.flow as isize,
+            3 => self.config.parity as isize,
+            4 => self.config.stop as isize,
             5 => {
-                if self.dtr {
+                if self.config.dtr {
                     1
                 } else {
                     0
@@ -211,48 +257,38 @@ impl DeviceConfigurer {
             .unwrap();
 
         match col {
-            0 => self.baud = BAUDS[i],
-            1 => self.bits = DATABITSS[i],
-            2 => self.flow = FLOWCONTROLS[i],
-            3 => self.parity = PARITYS[i],
-            4 => self.stop = STOPBITSS[i],
-            5 => self.dtr = i != 0,
+            0 => self.config.baud = BAUDS[i],
+            1 => self.config.bits = DATABITSS[i],
+            2 => self.config.flow = FLOWCONTROLS[i],
+            3 => self.config.parity = PARITYS[i],
+            4 => self.config.stop = STOPBITSS[i],
+            5 => self.config.dtr = i != 0,
             _ => panic!("Invalid enum passed in"),
         }
     }
 }
 
 impl EventListener for DeviceConfigurer {
-    fn listen(&mut self, e: Event) -> bool {
-        use Event::Key;
+    fn listen(&mut self, e: &GuiEvent) -> bool {
+        use GuiEvent::Crossterm;
         use KeyCode::{Down, Enter, Left, Right, Up};
+        use crossterm::event::Event::Key;
         let mut handled = true;
         match e {
-            Key(KeyEvent { code: Up, .. }) => {
+            Crossterm(Key(KeyEvent { code: Up, .. })) => {
                 if self.table_state.selected().unwrap_or(0) <= 1 {
                     self.table_state.select(Some(1))
                 } else {
                     self.table_state.scroll_up_by(1)
                 }
             }
-            Key(KeyEvent { code: Down, .. }) => self.table_state.scroll_down_by(1),
-            Key(KeyEvent { code: Left, .. }) => self.select(-1),
-            Key(KeyEvent { code: Right, .. }) => self.select(1),
-            Key(KeyEvent { code: Enter, .. }) => {
-                let config = tokio_serial::new(self.path.clone(), self.baud as u32)
-                    .data_bits(self.bits)
-                    .flow_control(self.flow)
-                    .parity(self.parity)
-                    .stop_bits(self.stop)
-                    .dtr_on_open(self.dtr);
-                match config.open_native_async() {
-                    Ok(s) => {
-                        _ = self
-                            .to_app
-                            .send(ToAppMsg::App(AppEvent::ConnectDevice(s, self.path.clone())))
-                    }
-                    Err(e) => _ = self.to_app.send(ToAppMsg::Log(e.description)),
-                };
+            Crossterm(Key(KeyEvent { code: Down, .. })) => self.table_state.scroll_down_by(1),
+            Crossterm(Key(KeyEvent { code: Left, .. })) => self.select(-1),
+            Crossterm(Key(KeyEvent { code: Right, .. })) => self.select(1),
+            Crossterm(Key(KeyEvent { code: Enter, .. })) => {
+                if let Some(tx) = self.tx.take() {
+                    tx.send(take(&mut self.config));
+                }
             }
             _ => handled = false,
         };
@@ -269,12 +305,12 @@ impl Drawable for DeviceConfigurer {
             panic!("Device configurer failed to configure");
         };
 
-        let bauds = format!("{}", self.baud as usize);
-        let dtr = format!("{}", self.dtr);
+        let bauds = format!("{}", self.config.baud as usize);
+        let dtr = format!("{}", self.config.dtr);
         let rows = [
             Row::new([
                 Text::raw("Path").left_aligned(),
-                Text::raw(&self.path).centered(),
+                Text::raw(&self.config.path).centered(),
             ]),
             Row::new([
                 Text::raw("Baud Rate").left_aligned(),
@@ -282,19 +318,19 @@ impl Drawable for DeviceConfigurer {
             ]),
             Row::new([
                 Text::raw("Bits per Word").left_aligned(),
-                Text::raw(DATABIT_STRS[self.bits as usize]).centered(),
+                Text::raw(DATABIT_STRS[self.config.bits as usize]).centered(),
             ]),
             Row::new([
                 Text::raw("Flow Control").left_aligned(),
-                Text::raw(FLOWCONTROL_STRS[self.flow as usize]).centered(),
+                Text::raw(FLOWCONTROL_STRS[self.config.flow as usize]).centered(),
             ]),
             Row::new([
                 Text::raw("Parity Bits").left_aligned(),
-                Text::raw(PARITY_STRS[self.parity as usize]).centered(),
+                Text::raw(PARITY_STRS[self.config.parity as usize]).centered(),
             ]),
             Row::new([
                 Text::raw("Stop Bits").left_aligned(),
-                Text::raw(STOPBIT_STRS[self.stop as usize]).centered(),
+                Text::raw(STOPBIT_STRS[self.config.stop as usize]).centered(),
             ]),
             Row::new([
                 Text::raw("DTR on start").left_aligned(),
@@ -314,5 +350,9 @@ impl Drawable for DeviceConfigurer {
         .block(Block::new().borders(Borders::all().difference(Borders::TOP)))
         .centered();
         description.render(*desc_area, buf);
+    }
+
+    fn alive(&self) -> bool {
+        self.alive
     }
 }

@@ -1,51 +1,66 @@
-use std::{
-    path::{Path, PathBuf},
-    process::ExitStatus,
-    time::Duration,
-};
+use std::{path::Path, process::ExitStatus, time::Duration};
 
 use color_eyre::{
     Report, Result,
     eyre::{self, OptionExt},
 };
-use eyre::eyre;
-use futures::{FutureExt, StreamExt, future::pending};
-use notify::Watcher;
-use ratatui::crossterm::event::Event as CrosstermEvent;
+use eyre::{Context, eyre};
+use futures::{FutureExt, StreamExt, channel::mpsc::UnboundedSender};
+use notify::{RecommendedWatcher, Watcher};
+use ratatui::{buffer::Buffer, crossterm::event::Event as CrosstermEvent, layout::Rect};
 use serialport::SerialPort;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     select,
-    sync::mpsc,
+    sync::{mpsc, oneshot},
 };
-use tokio_serial::{SerialPortBuilderExt, SerialStream};
+use tokio_serial::SerialStream;
 
 use tokio::time::sleep as tokio_sleep;
 
-#[derive(Debug)]
-pub enum ToAppMsg {
-    Crossterm(CrosstermEvent),
-    App(AppEvent),
-    RecieveSerial(Result<FromSerialData>),
-    SerialConnected(String),
-    SerialGone,
-    Log(String),
-    LogResult(ExitStatus, String, String),
+use crate::device_finder::DeviceConfig;
+
+pub trait EventListener {
+    fn listen(&mut self, e: &GuiEvent) -> bool;
 }
 
-#[derive(Debug)]
-pub enum FromAppMsg {
-    ConnectDevice(SerialStream, String),
-    WriteSerial(ToSerialData),
-    UploadFile(PathBuf, String),
+pub trait Drawable {
+    fn alive(&self) -> bool;
+    fn draw(&mut self, area: Rect, buf: &mut Buffer);
+}
+
+pub trait Reactive: EventListener + Drawable + Send {}
+
+impl<T> Reactive for T where T: EventListener + Drawable + Send {}
+
+pub enum ToAppEvent {
+    App(AppEvent),
+    Popup(Box<dyn Reactive>),
+    Gui(GuiEvent),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Severity {
+    Error,
+    Info,
+    Debug,
+}
+
+#[derive(Clone, Debug)]
+pub enum GuiEvent {
+    Crossterm(CrosstermEvent),
+    Log(Severity, String),
+    Serial(FromSerialData),
 }
 
 #[derive(Debug)]
 pub enum AppEvent {
-    SelectDevice(String),
-    ConnectDevice(SerialStream, String),
-    UploadFile(PathBuf),
-    UploadCmd(String),
+    RequestSerial,
+    SerialConnect(mpsc::UnboundedSender<ToSerialData>, DeviceConfig),
+    SendSerial(ToSerialData),
+    RequestUpload,
+    SendUpload(oneshot::Sender<()>),
+    Watcher(FromFileWatcher),
     Leave,
     Quit,
 }
@@ -59,341 +74,148 @@ pub enum ToSerialData {
     RequestStatus,
 }
 
-enum ToFileWatcher {
-    DoneDisconnect,
+#[derive(Clone, Debug)]
+pub enum FromSerialData {
+    Connect(String),
+    Data(Vec<u8>),
+    Status { dtr: bool, cts: bool },
+    Gone,
 }
 
-enum FromFileWatcher {
-    LogErr(String),
-    LogResult(ExitStatus, String, String),
+#[derive(Clone, Debug)]
+pub enum FromFileWatcher {
     DisonnectRequest,
     ReconnectRequest,
 }
 
-#[derive(Clone, Debug)]
-pub enum FromSerialData {
-    Data(Vec<u8>),
-    Status { dtr: bool, cts: bool },
-}
+#[derive(Clone)]
+pub struct Messenger(mpsc::UnboundedSender<ToAppEvent>);
 
-#[derive(Debug)]
-pub struct EventHandler {
-    pub to_self: mpsc::UnboundedSender<ToAppMsg>,
-    from_mgr: mpsc::UnboundedReceiver<ToAppMsg>,
-    to_mgr: mpsc::UnboundedSender<FromAppMsg>,
-}
-
-impl EventHandler {
-    pub fn new() -> Self {
-        let (to_app, from_mgr) = mpsc::unbounded_channel();
-        let (to_mgr, from_app) = mpsc::unbounded_channel();
-        let to_app2 = to_app.clone();
-        tokio::spawn(async move { ManagerTask::new(to_app2, from_app).run().await });
-        Self {
-            to_self: to_app,
-            from_mgr,
-            to_mgr,
-        }
+impl Messenger {
+    pub fn new(m: mpsc::UnboundedSender<ToAppEvent>) -> Self {
+        Self(m)
     }
 
-    pub async fn next(&mut self) -> color_eyre::Result<ToAppMsg> {
-        self.from_mgr
-            .recv()
-            .await
-            .ok_or_eyre("Failed to receive event")
+    pub fn send_term(&self, e: CrosstermEvent) {
+        _ = self.0.send(ToAppEvent::Gui(GuiEvent::Crossterm(e)));
+    }
+    pub fn send_app(&self, e: AppEvent) {
+        _ = self.0.send(ToAppEvent::App(e));
+    }
+    pub fn new_component(&self, c: Box<dyn Reactive>) {
+        _ = self.0.send(ToAppEvent::Popup(c));
+    }
+    pub fn log(&self, s: Severity, e: String) {
+        _ = self.0.send(ToAppEvent::Gui(GuiEvent::Log(s, e)));
+    }
+    pub fn send_serial(&self, d: FromSerialData) {
+        _ = self.0.send(ToAppEvent::Gui(GuiEvent::Serial(d)));
+    }
+    pub fn send_file(&self, f: FromFileWatcher) {
+        _ = self.0.send(ToAppEvent::App(AppEvent::Watcher(f)));
     }
 
-    pub fn send_self(&mut self, app_event: AppEvent) {
-        let _ = self.to_self.send(ToAppMsg::App(app_event));
-    }
-
-    pub fn send(&mut self, message: FromAppMsg) {
-        let _ = self.to_mgr.send(message);
+    pub fn is_closed(&self) -> bool {
+        self.0.is_closed()
     }
 }
 
-impl Default for EventHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-struct ManagerTask {
-    to_app: mpsc::UnboundedSender<ToAppMsg>,
-    from_app: mpsc::UnboundedReceiver<FromAppMsg>,
-    serial: Option<SerialHandler>,
-    uploader: Option<FileWatcher>,
-}
-
-async fn maybe_recv<T>(rec: Option<&mut mpsc::UnboundedReceiver<T>>) -> Option<T> {
-    match rec {
-        Some(r) => r.recv().await,
-        None => pending().await,
-    }
-}
-
-async fn maybe_recv_bound<T>(rec: Option<&mut mpsc::Receiver<T>>) -> Option<T> {
-    match rec {
-        Some(r) => r.recv().await,
-        None => pending().await,
-    }
-}
-// the struct tokio_serial is nice as a builder
-// but is terrible for actually storing, which is kinda
-// of dumb since it contains very little actual stored information
-struct SerialConfig {
-    path: String,
-    baud: u32,
-    data: tokio_serial::DataBits,
-    flow: tokio_serial::FlowControl,
-    parity: tokio_serial::Parity,
-    stop: tokio_serial::StopBits,
-}
-
-impl ManagerTask {
-    fn new(
-        to_app: mpsc::UnboundedSender<ToAppMsg>,
-        from_app: mpsc::UnboundedReceiver<FromAppMsg>,
-    ) -> Self {
-        Self {
-            to_app,
-            from_app,
-            serial: None,
-            uploader: None,
-        }
-    }
-
-    fn get_config(serial: &SerialStream, path: String) -> Result<SerialConfig> {
-        let baud = serial.baud_rate()?;
-        let data = serial.data_bits()?;
-        let flow = serial.flow_control()?;
-        let parity = serial.parity()?;
-        let stop = serial.stop_bits()?;
-        Ok(SerialConfig {
-            path,
-            baud,
-            data,
-            flow,
-            parity,
-            stop,
-        })
-    }
-
-    fn create_stream(cfg: &SerialConfig) -> Result<SerialStream> {
-        tokio_serial::new(cfg.path.clone(), cfg.baud)
-            .data_bits(cfg.data)
-            .flow_control(cfg.flow)
-            .parity(cfg.parity)
-            .stop_bits(cfg.stop)
-            .open_native_async()
-            .map_err(|e| e.into())
-    }
-
-    async fn run(mut self) -> Result<()> {
-        use FromAppMsg::{ConnectDevice, UploadFile, WriteSerial};
-        use FromFileWatcher::{DisonnectRequest, LogErr, LogResult, ReconnectRequest};
+pub fn crossterm_handler(to_app: Messenger) {
+    tokio::spawn(async move {
         let mut reader = crossterm::event::EventStream::new();
-        // this is kinda stupid but is necessary to get rust to shut up
-        let mut reset_serial = false;
-        let mut reset_upload = false;
-        let mut new_serial: Option<(SerialStream, String)> = None;
-        let mut old_config: Option<SerialConfig> = None;
         loop {
-            let no_device = eyre!("No device connected!");
-            if reset_serial {
-                self.serial = None;
-                let _ = self.to_app.send(ToAppMsg::SerialGone);
-                if let Some(u) = self.uploader.as_mut() {
-                    _ = u.to_watcher.send(ToFileWatcher::DoneDisconnect).await;
-                }
-                reset_serial = false;
-            }
-
-            if reset_upload {
-                self.uploader = None;
-                reset_upload = false;
-            }
-
-            if let Some((se, name)) = new_serial.take() {
-                match Self::get_config(&se, name) {
-                    Ok(s) => old_config = Some(s),
-                    Err(e) => {
-                        _ = self
-                            .to_app
-                            .send(ToAppMsg::Log(format!("Failed to connect to serial: {}", e)));
-                        continue;
-                    }
-                };
-                _ = self.to_app.send(ToAppMsg::SerialConnected(
-                    se.name().unwrap_or("Virtual".into()),
-                ));
-                self.serial = Some(SerialHandler::new(se));
-            }
-            let (se_tx, se_rx) = self
-                .serial
-                .as_mut()
-                .map(
-                    |SerialHandler {
-                         app_tx: tx,
-                         app_rx: rx,
-                     }| (tx, rx),
-                )
-                .unzip();
-
-            let serial_read = maybe_recv(se_rx);
-            let file_read = maybe_recv_bound(self.uploader.as_mut().map(|u| &mut u.from_watcher));
             let crossterm_event = reader.next().fuse();
-            tokio::select! {
-              _ = self.to_app.closed() => {
-                break;
-              }
-              Some(Ok(evt)) = crossterm_event => {
-                let _ = self.to_app.send(ToAppMsg::Crossterm(evt));
-              }
-              Some(e) = self.from_app.recv() => {
-               match e {
-                WriteSerial(s) => {
-                   let _ = se_tx
-                     .ok_or(no_device)
-                     .and_then(|serial| serial.send(s).map_err(|e| e.into()))
-                     .map_err(|e| self.to_app.send(ToAppMsg::RecieveSerial(Err(e))));
-                }
-                ConnectDevice(serial, name) => {
-                   new_serial = Some((serial, name));
-                }
-                UploadFile(f, cmd) => {
-                   let up = match FileWatcher::new(&f, cmd) {
-                       Ok(u) => u,
-                       Err(e) => { _ = self.to_app.send(ToAppMsg::Log(format!("Unable to open file: {}", e))); continue;}
-                   };
-                   self.uploader = Some(up);
-                }
-               }
-              },
-              r = serial_read => {
-                match r{
-                  None => {  _ = self.to_app.send(ToAppMsg::SerialGone); reset_serial = true;  }
-                  Some(data) => {  _ = self.to_app.send(ToAppMsg::RecieveSerial(data));}
-                }
-              }
-              f = file_read =>{
-                  match f {
-                    None => { reset_upload = true; },
-                    Some(DisonnectRequest) => {
-                     if self.serial.is_none(){
-                       _ = self.to_app.send(ToAppMsg::Log("Attempted to flash when nothing is connected".into()));
-                     }else{
-                       reset_serial = true;
-                     }
-                    },
-                    Some(ReconnectRequest) => {
-                        let Some(ref cfg) = old_config else {
-                            continue;
-                        };
-                        let Ok(stream) = Self::create_stream(cfg) else{
-                          _ = self.to_app.send(ToAppMsg::Log("Failed to construct serial configuration".into()));
-                          continue;
-                        };
-                        new_serial = Some((stream, cfg.path.clone()));
-                    },
-                    Some(LogErr(e) ) => { _ = self.to_app.send(ToAppMsg::Log(e))  },
-                    Some(LogResult(s, o, e)) => { _ = self.to_app.send(ToAppMsg::LogResult(s, o, e))  },
-                }
-              }
-            };
-        }
-        Ok(())
-    }
-}
-
-struct SerialHandler {
-    app_tx: mpsc::UnboundedSender<ToSerialData>,
-    app_rx: mpsc::UnboundedReceiver<Result<FromSerialData>>,
-}
-
-impl SerialHandler {
-    fn new(mut device: SerialStream) -> Self {
-        use ToSerialData::{CTS, DTR, Data, Disconnect, RequestStatus};
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let (data_tx, data_rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            let mut buf = [0; 128];
-            let mut alive = true;
-            while alive {
-                // I hate the formatting, and macros are atrocious
-                // unfortunately, there's literally no better way to represent the problem
-                select! {
-                   _ = data_tx.closed() => break,
-                  read = device.read(&mut buf) => { let len = match read {
-                        Ok(l) => l,
-                        Err(e) => {
-                            let _ = data_tx.send(Err(e.into()));
-                            break;
-                        }
-                    };
-                    if len == 0 {
-                        let _ = data_tx.send(Err(eyre!("Out of bytes to read!")));
-                        break;
-                    } else {
-                        // If we failed to send, either the client's dead or something weird has happened, so die early
-                        if data_tx.send(Ok(FromSerialData::Data(Vec::from(&buf[0..len])))).is_err() {break};
-                    }
-
-                    },
-                    event = event_rx.recv() => {
-                    let err: Report = match event {
-                        Some(Data(s)) => {
-                            let Err(e) = device.write_all(s.as_bytes()).await else {
-                                continue;
-                            };
-                            e.into()
-                        }
-                        Some(DTR(b)) => {
-                            let Err(e) = device.write_data_terminal_ready(b) else {
-                                continue;
-                            };
-                            e.into()
-                        }
-                        Some(CTS(b)) => {
-                            let Err(e) = device.write_request_to_send(b) else {
-                                continue;
-                            };
-                            e.into()
-                        }
-                        Some(Disconnect) =>{
-                            alive = false; continue;
-                        }
-                        Some(RequestStatus) =>{
-                            let dtr = match device.read_data_set_ready(){
-                                Ok(d) => d,
-                                Err(e) => { _ = data_tx.send(Err(e.into())); true }
-                            };
-                            let cts = match device.read_clear_to_send(){
-                                Ok(d) => d,
-                                Err(e) => { _ = data_tx.send(Err(e.into())); true }
-                            };
-
-                            if data_tx.send(
-                              Ok(
-                                FromSerialData::Status{ dtr, cts }
-                              )
-                            ).is_err() {break};
-                            continue;
-                        }
-                        None => eyre!("Serial terminal closed!"),
-                    };
-                    let _ =  data_tx.send(Err(err));
+            if let Some(Ok(evt)) = crossterm_event.await {
+                if to_app.is_closed() {
                     break;
                 }
-                };
+                let _ = to_app.send_term(evt);
             }
-        });
-
-        Self {
-            app_tx: event_tx,
-            app_rx: data_rx,
         }
-    }
+    });
+}
+
+pub fn serial_handler(
+    mut device: SerialStream,
+    data_tx: Messenger,
+) -> mpsc::UnboundedSender<ToSerialData> {
+    use Severity::Error;
+    use ToSerialData::{CTS, DTR, Data, Disconnect, RequestStatus};
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        data_tx.send_serial(FromSerialData::Connect(
+            device.name().unwrap_or("Virtual".into()),
+        ));
+        let mut buf = [0; 128];
+        let mut alive = true;
+        while alive {
+            // I hate the formatting, and macros are atrocious
+            // unfortunately, there's literally no better way to represent the problem
+            select! {
+               _ = data_tx.0.closed() => break,
+              read = device.read(&mut buf) => { let len = match read {
+                    Ok(l) => l,
+                    Err(e) => {
+                        let _ = data_tx.log(Error, format!("Error reading serial: {}",e)) ;
+                        break;
+                    }
+                };
+                    if len == 0 {
+                        let _ = data_tx.log(Error, "Serial has been disconnected!".into());
+                        break;
+                    } else {
+                        data_tx.send_serial(FromSerialData::Data(Vec::from(&buf[0..len])));
+                    }
+                },
+                event = event_rx.recv() => {
+                let err: Report = match event {
+                    Some(Data(s)) => {
+                        let Err(e) = device.write_all(s.as_bytes()).await else {
+                            continue;
+                        };
+                        e.into()
+                    }
+                    Some(DTR(b)) => {
+                        let Err(e) = device.write_data_terminal_ready(b) else {
+                            continue;
+                        };
+                        e.into()
+                    }
+                    Some(CTS(b)) => {
+                        let Err(e) = device.write_request_to_send(b) else {
+                            continue;
+                        };
+                        e.into()
+                    }
+                    Some(Disconnect) =>{
+                        alive = false; continue;
+                    }
+                    Some(RequestStatus) =>{
+                        let dtr = match device.read_data_set_ready(){
+                            Ok(d) => d,
+                            Err(e) => { data_tx.log(Error, format!("{}", e)); true }
+                        };
+                        let cts = match device.read_clear_to_send(){
+                            Ok(d) => d,
+                            Err(e) => { data_tx.log(Error, format!("{}", e)); true }
+                        };
+
+                        data_tx.send_serial(
+                            FromSerialData::Status{ dtr, cts }
+                        );
+                        continue;
+                    }
+                    None => eyre!("Serial terminal closed!"),
+                };
+                let _ =  data_tx.log(Error, format!("{}", err));
+                break;
+            }
+            };
+        }
+        data_tx.send_serial(FromSerialData::Gone);
+    });
+
+    event_tx
 }
 
 pub fn pseudo_serial() -> SerialStream {
@@ -430,94 +252,83 @@ pub fn pseudo_serial() -> SerialStream {
     computer
 }
 
-struct FileWatcher {
-    from_watcher: mpsc::Receiver<FromFileWatcher>,
-    to_watcher: mpsc::Sender<ToFileWatcher>,
-    watcher: notify::RecommendedWatcher,
-}
-
-struct WatcherImpl {
-    to_app: mpsc::Sender<FromFileWatcher>,
-    from_app: mpsc::Receiver<ToFileWatcher>,
-    cmd: Vec<String>,
-}
+struct WatcherImpl(mpsc::UnboundedSender<notify::Result<notify::Event>>);
 
 impl notify::EventHandler for WatcherImpl {
     fn handle_event(&mut self, event: notify::Result<notify::Event>) {
-        use FromFileWatcher::{DisonnectRequest, LogErr, LogResult, ReconnectRequest};
-        use notify::{
-            Event,
-            EventKind::{Create, Modify},
-            event::{CreateKind::File, ModifyKind::Data},
-        };
-        match event {
-            Err(e) => {
-                _ = self.to_app.send(FromFileWatcher::LogErr(e.to_string()));
-            }
-            Ok(Event {
-                kind: Modify(Data(..)) | Create(File),
-                ..
-            }) => {
-                _ = self.to_app.blocking_send(DisonnectRequest);
-                // wait for disconnect to finish
-                let r = self.from_app.blocking_recv();
-                if r.is_none() {
-                    // we're already dead but haven't realized it
-                    return;
-                }
-                self.execute();
-                _ = self.to_app.blocking_send(ReconnectRequest);
-            }
-            _ => {}
-        };
+        _ = self.0.send(event);
     }
 }
 
-impl WatcherImpl {
-    fn execute(&self) {
-        use FromFileWatcher::{LogErr, LogResult};
-        use tokio::process::Command;
-        tokio::spawn(Command::new(&self.cmd[0]).args(&self.cmd[1..]).output());
-        /*match out {
-            // This only watches 1 file, so we don't bother checking which file it was
-            Ok(Output {
-                status,
-                stdout,
-                stderr,
-            }) => {
-                let stdout = String::from_utf8_lossy(&stdout);
-                let stderr = String::from_utf8_lossy(&stderr);
-                _ = self
-                    .to_app
-                    .blocking_send(LogResult(status, stderr.into(), stdout.into()));
-            }
-            Err(e) => _ = self.to_app.blocking_send(LogErr(e.to_string())),
-        };*/
-    }
+struct UploaderImpl {
+    _watcher: RecommendedWatcher,
+    events: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
+    to_dash: Messenger,
+    deadman: oneshot::Receiver<()>,
+    cmd: Vec<String>,
 }
 
-impl FileWatcher {
-    pub fn new(file: &Path, cmd: String) -> Result<Self> {
-        let filename = file.to_str().ok_or_eyre("Firmware filename is not UTF8")?;
-        let mut cmd = shlex::split(&cmd).ok_or_eyre("Unable to lex command")?;
-        *cmd.iter_mut()
-            .find(|p| *p == "BAB")
-            .ok_or_eyre("Firmware arguments do not contain #BIN#")? = filename.into();
-        let (to_app, from_watcher) = mpsc::channel(8);
-        let (to_watcher, from_app) = mpsc::channel(8);
-
-        let watcher = WatcherImpl {
-            to_app,
-            from_app,
+pub fn new_filewatcher(file: &Path, cmd: String, events: Messenger) -> Result<oneshot::Sender<()>> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let (killswitch, dead) = oneshot::channel();
+    let mut watcher = notify::recommended_watcher(WatcherImpl(tx))?;
+    watcher.watch(file, notify::RecursiveMode::Recursive)?;
+    let cmd = shlex::split(&cmd).ok_or_eyre("Unable to parse command")?;
+    tokio::spawn(async {
+        UploaderImpl {
+            _watcher: watcher,
+            events: rx,
+            to_dash: events,
             cmd,
-        };
-        watcher.execute();
-        let mut watcher = notify::recommended_watcher(watcher)?;
-        watcher.watch(file, notify::RecursiveMode::Recursive)?;
-        Ok(Self {
-            to_watcher,
-            from_watcher,
-            watcher,
-        })
+            deadman: dead,
+        }
+        .run()
+        .await;
+    });
+
+    Ok(killswitch)
+}
+
+impl UploaderImpl {
+    async fn exec(&self) -> Result<()> {
+        let out = tokio::process::Command::new(&self.cmd[0])
+            .args(&self.cmd[1..])
+            .output()
+            .await
+            .wrap_err("Unable to execute command")?;
+        self.to_dash.log(
+            Severity::Info,
+            format!("{}: {}", String::from_utf8_lossy(&out.stdout), out.status),
+        );
+        if !out.stderr.is_empty() {
+            self.to_dash.log(
+                Severity::Error,
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    async fn run(&mut self) {
+        use notify::EventKind::{Any, Create, Modify};
+        loop {
+            if self.deadman.try_recv().is_ok() {
+                return;
+            }
+            match self.events.recv().await.unwrap() {
+                Ok(notify::Event {
+                    kind: Any | Create(..) | Modify(..),
+                    ..
+                }) => {
+                    if let Err(e) = self.exec().await {
+                        self.to_dash.log(Severity::Error, e.to_string())
+                    }
+                }
+                Err(e) => self
+                    .to_dash
+                    .log(Severity::Error, format!("Error watching file: {}", e)),
+                _ => {}
+            };
+        }
     }
 }

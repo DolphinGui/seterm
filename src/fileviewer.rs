@@ -1,9 +1,6 @@
-use std::{fs::DirEntry, path::PathBuf};
+use std::{fs::DirEntry, mem::take, path::PathBuf};
 
-use crate::{
-    device_finder::{Drawable, EventListener},
-    event::{AppEvent, ToAppMsg},
-};
+use crate::event::{AppEvent, Drawable, EventListener, GuiEvent, ToAppEvent};
 
 use eyre::{Result, eyre};
 use ratatui::{
@@ -11,18 +8,18 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, List, ListState, Paragraph, StatefulWidget, Widget},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 pub struct FileViewer {
     cur_dir: PathBuf,
     contents: Vec<DirEntry>,
-    to_app: mpsc::UnboundedSender<ToAppMsg>,
     list_contents: Vec<String>,
     list_state: ListState,
+    tx: Option<oneshot::Sender<PathBuf>>,
 }
 
 impl FileViewer {
-    pub fn new(to_app: mpsc::UnboundedSender<ToAppMsg>) -> Result<FileViewer> {
+    pub fn new() -> Result<(FileViewer, oneshot::Receiver<PathBuf>)> {
         let cur_dir =
             std::env::current_dir().map_err(|e| eyre!("Error reading current directory: {}", e))?;
         let contents: Vec<DirEntry> = cur_dir.read_dir()?.filter_map(|r| r.ok()).collect();
@@ -36,13 +33,19 @@ impl FileViewer {
                 }
             })
             .collect();
-        Ok(Self {
-            cur_dir,
-            contents,
-            to_app,
-            list_contents,
-            list_state: ListState::default(),
-        })
+
+        let (tx, rx) = oneshot::channel();
+        let tx = Some(tx);
+        Ok((
+            Self {
+                cur_dir,
+                contents,
+                list_contents,
+                list_state: ListState::default(),
+                tx,
+            },
+            rx,
+        ))
     }
 
     fn go_parent(&mut self) -> Result<()> {
@@ -92,34 +95,40 @@ impl Drawable for FileViewer {
             .block(Block::bordered());
         <List as StatefulWidget>::render(list, area, buf, &mut self.list_state);
     }
+
+    fn alive(&self) -> bool {
+        self.tx.is_some()
+    }
 }
 
 impl EventListener for FileViewer {
-    fn listen(&mut self, e: crossterm::event::Event) -> bool {
+    fn listen(&mut self, e: &GuiEvent) -> bool {
+        use GuiEvent::Crossterm;
         use crossterm::event::{
             Event::Key,
             KeyCode::{Down, Enter, Left, Right, Up},
             KeyEvent,
         };
         match e {
-            Key(KeyEvent { code: Left, .. }) => todo!(),
-            Key(KeyEvent {
+            Crossterm(Key(KeyEvent { code: Left, .. })) => todo!(),
+            Crossterm(Key(KeyEvent {
                 code: Right | Enter,
                 ..
-            }) => {
+            })) => {
                 let Some(selected) = self.list_state.selected() else {
                     return false;
                 };
                 let selected = &self.contents[selected];
-                self.to_app
-                    .send(ToAppMsg::App(AppEvent::UploadFile(selected.path())));
+                if let Some(tx) = self.tx.take() {
+                    tx.send(selected.path());
+                }
                 true
             }
-            Key(KeyEvent { code: Up, .. }) => {
+            Crossterm(Key(KeyEvent { code: Up, .. })) => {
                 self.list_state.select_previous();
                 true
             }
-            Key(KeyEvent { code: Down, .. }) => {
+            Crossterm(Key(KeyEvent { code: Down, .. })) => {
                 self.list_state.select_next();
                 true
             }
@@ -130,17 +139,19 @@ impl EventListener for FileViewer {
 
 pub struct CmdInput {
     contents: String,
-    to_app: mpsc::UnboundedSender<ToAppMsg>,
+    tx: Option<oneshot::Sender<String>>,
 }
 
-// Yes this is highly similar to the input box in ui.rs, may consider refactoring later to
-// combine the two. For now Reactive widgets and what events they can source are tied to their type.
 impl CmdInput {
-    pub fn new(default: String, to_app: mpsc::UnboundedSender<ToAppMsg>) -> CmdInput {
-        Self {
-            contents: default,
-            to_app,
-        }
+    pub fn new(default: String) -> (CmdInput, oneshot::Receiver<String>) {
+        let (tx, rx) = oneshot::channel();
+        (
+            Self {
+                contents: default,
+                tx: Some(tx),
+            },
+            rx,
+        )
     }
 }
 
@@ -153,44 +164,47 @@ impl Drawable for CmdInput {
             .left_aligned()
             .render(area, buf);
     }
+
+    fn alive(&self) -> bool {
+        self.tx.is_some()
+    }
 }
 
 impl EventListener for CmdInput {
-    fn listen(&mut self, e: crossterm::event::Event) -> bool {
+    fn listen(&mut self, e: &GuiEvent) -> bool {
+        use GuiEvent::Crossterm;
         use crossterm::event::{
             Event::Key,
             KeyCode::{Backspace, Char, Enter},
             KeyEvent, KeyModifiers,
         };
         match e {
-            Key(KeyEvent {
+            Crossterm(Key(KeyEvent {
                 code: Char(c),
                 modifiers,
                 ..
-            }) if modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
-                self.contents.push(c);
+            })) if modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
+                self.contents.push(*c);
                 true
             }
-            Key(KeyEvent {
+            Crossterm(Key(KeyEvent {
                 code: Enter,
                 modifiers: KeyModifiers::NONE,
                 ..
-            }) => {
+            })) => {
                 if self.contents.is_empty() {
                     return false;
                 }
-                _ = self
-                    .to_app
-                    .send(ToAppMsg::App(AppEvent::UploadCmd(std::mem::take(
-                        &mut self.contents,
-                    ))));
+                if let Some(tx) = self.tx.take() {
+                    tx.send(take(&mut self.contents));
+                }
                 true
             }
-            Key(KeyEvent {
+            Crossterm(Key(KeyEvent {
                 code: Backspace,
                 modifiers: KeyModifiers::NONE,
                 ..
-            }) => {
+            })) => {
                 if self.contents.is_empty() {
                     return false;
                 }
