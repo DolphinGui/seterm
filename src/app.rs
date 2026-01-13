@@ -1,4 +1,7 @@
+use std::path::PathBuf;
+
 use crate::{
+    cli::DeviceOptions,
     device_finder::{Baud, DeviceConfig, DeviceConfigurer, DeviceFinder},
     event::{
         AppEvent, FromFileWatcher, FromSerialData, GuiEvent, Messenger, Reactive, Severity,
@@ -6,6 +9,7 @@ use crate::{
         serial_handler,
     },
     fileviewer::{CmdInput, FileViewer},
+    notif::Notification,
     ui::Dashboard,
 };
 
@@ -64,9 +68,9 @@ impl App {
     pub async fn run(
         mut self,
         mut terminal: DefaultTerminal,
-        default_baud: Baud,
-        _try_device: Option<String>,
+        mut default_dev: DeviceOptions,
         default_cmd: String,
+        default_path: Option<String>,
     ) -> color_eyre::Result<()> {
         use AppEvent::{
             Leave, Quit, RequestSerial, RequestUpload, SendSerial, SendUpload, SerialConnect,
@@ -74,6 +78,9 @@ impl App {
         };
         use ToAppEvent::{App, Gui, Popup};
         trace!("Starting main loop!");
+        if let Some(device) = default_dev.to_config() {
+            self.connect_serial_now(device);
+        }
         while self.running {
             terminal.draw(|frame| self.draw(frame))?;
             match self.next().await? {
@@ -91,8 +98,10 @@ impl App {
                     }
                 }
                 App(Quit) => self.running = false,
-                App(RequestSerial) => self.connect_serial(default_baud),
-                App(RequestUpload) => self.upload_file(default_cmd.clone(), true),
+                App(RequestSerial) => self.connect_serial(default_dev.clone()),
+                App(RequestUpload) => {
+                    self.upload_file(default_path.clone(), default_cmd.clone(), true)
+                }
                 App(SendSerial(s)) => {
                     self.send_serial(s);
                 }
@@ -145,6 +154,9 @@ impl App {
             (KeyModifiers::CONTROL, Char('u')) => {
                 self.to_self.send_app(AppEvent::RequestUpload);
             }
+            (KeyModifiers::ALT, Char('?')) => {
+                self.create_help();
+            }
             _ => {}
         }
     }
@@ -192,7 +204,7 @@ impl App {
         trace!("Done Drawing");
     }
 
-    fn connect_serial(&mut self, baud: Baud) {
+    fn connect_serial(&mut self, cfg: DeviceOptions) {
         use crate::event::Severity;
         let app = self.to_self.clone();
         tokio::spawn(
@@ -201,7 +213,7 @@ impl App {
                     let (finder, rx) = DeviceFinder::new()?;
                     app.new_component(Box::new(finder));
                     let Ok(path) = rx.await else { return Ok(()) };
-                    let (popup, config) = DeviceConfigurer::new(path, baud);
+                    let (popup, config) = DeviceConfigurer::new(cfg.to_config_path(path.into()));
                     app.new_component(Box::new(popup));
                     let Ok(config) = config.await else {
                         return Ok(());
@@ -224,12 +236,31 @@ impl App {
         );
     }
 
-    fn upload_file(&mut self, _path: String, _autorun: bool) {
+    fn connect_serial_now(&mut self, config: DeviceConfig) {
+        let serial = match config.clone().to_serial() {
+            Ok(o) => o,
+            Err(e) => {
+                self.to_self.log(
+                    Severity::Error,
+                    format!("Unable to connect to serial: {}", e),
+                );
+                return;
+            }
+        };
+        let serial = serial_handler(serial, self.to_self.clone());
+        self.to_self
+            .send_app(AppEvent::SerialConnect(serial, config));
+    }
+
+    fn upload_file(&mut self, path: Option<String>, cmd_default: String, autorun: bool) {
         use crate::event::Severity;
         let to_dash = self.to_self.clone();
         tokio::spawn(
             async move {
-                let Ok((finder, f)) = FileViewer::new(to_dash.clone()) else {
+                let path = path.map(PathBuf::from);
+                let Ok((finder, f)) =
+                    FileViewer::new("Select Binary".into(), to_dash.clone(), path)
+                else {
                     to_dash.log(Severity::Error, "Could not open working directory".into());
                     return;
                 };
@@ -237,12 +268,15 @@ impl App {
                 let Ok(file) = f.await else {
                     return;
                 };
-                let (input, cmd) = CmdInput::new(Default::default());
+                let (input, cmd) = CmdInput::new(
+                    "Enter upload command (replace binary path with #BIN#)".into(),
+                    cmd_default,
+                );
                 to_dash.new_component(Box::new(input));
                 let Ok(cmd) = cmd.await else {
                     return;
                 };
-                let Ok(watcher) = new_filewatcher(&file, cmd, to_dash.clone()) else {
+                let Ok(watcher) = new_filewatcher(&file, cmd, to_dash.clone(), autorun) else {
                     return;
                 };
                 to_dash.send_app(AppEvent::SendUpload(watcher));
@@ -258,7 +292,7 @@ impl App {
     }
 
     fn send_serial(&mut self, data: ToSerialData) {
-        if let Some(se) = self.serial.as_ref() {
+        if let Some(ref se) = self.serial {
             if se.send(data).is_err() {
                 self.serial = None;
             }
@@ -268,6 +302,13 @@ impl App {
                 "Not currently connected to a device".into(),
             );
         }
+    }
+
+    fn create_help(&mut self) {
+        const HELP_STRING: &str = "ALT+?: Show this help\nctrl+c: Exit application\n\
+          ESC: Close popup/exit application\nctrl+f: Find serial\nctrl+u: Upload file";
+        self.to_self
+            .new_component(Box::new(Notification::new(HELP_STRING.into())));
     }
 }
 

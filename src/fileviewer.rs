@@ -12,6 +12,7 @@ use ratatui::{
 use tokio::sync::{mpsc, oneshot};
 
 pub struct FileViewer {
+    title: String,
     cur_dir: PathBuf,
     contents: Vec<DirEntry>,
     list_contents: Vec<String>,
@@ -21,10 +22,34 @@ pub struct FileViewer {
 }
 
 impl FileViewer {
-    pub fn new(to_app: Messenger) -> Result<(FileViewer, oneshot::Receiver<PathBuf>)> {
-        let cur_dir =
-            std::env::current_dir().map_err(|e| eyre!("Error reading current directory: {}", e))?;
+    pub fn new(
+        title: String,
+        to_app: Messenger,
+        default_select: Option<PathBuf>,
+    ) -> Result<(FileViewer, oneshot::Receiver<PathBuf>)> {
+        let cur_dir = if let Some(ref file) = default_select {
+            if file.metadata()?.is_dir() {
+                file.clone()
+            } else {
+                file.parent()
+                    .ok_or_eyre("Cannot read parent of root")?
+                    .to_path_buf()
+            }
+        } else {
+            std::env::current_dir().map_err(|e| eyre!("Error reading current directory: {}", e))?
+        };
         let contents: Vec<DirEntry> = cur_dir.read_dir()?.filter_map(|r| r.ok()).collect();
+        let mut selection = None;
+        if let Some(file) = default_select
+            && file.metadata().unwrap().is_file()
+        {
+            selection = contents
+                .iter()
+                .enumerate()
+                .skip_while(|(_, f)| f.path() != file)
+                .next()
+                .map(|(i, _)| i);
+        }
         let list_contents = contents
             .iter()
             .map(|e| {
@@ -40,10 +65,11 @@ impl FileViewer {
         let tx = Some(tx);
         Ok((
             Self {
+                title,
                 cur_dir,
                 contents,
                 list_contents,
-                list_state: ListState::default(),
+                list_state: ListState::default().with_selected(selection),
                 tx,
                 to_app,
             },
@@ -100,7 +126,7 @@ impl Drawable for FileViewer {
         let text = self.list_contents.iter().map(Text::raw);
         let list = List::new(text)
             .highlight_style(Style::default().reversed())
-            .block(Block::bordered());
+            .block(Block::bordered().title_bottom(Line::raw(&self.title).centered()));
         frame.render_stateful_widget(list, area, &mut self.list_state);
     }
 
@@ -142,15 +168,17 @@ impl EventListener for FileViewer {
 }
 
 pub struct CmdInput {
+    title: String,
     contents: String,
     tx: Option<oneshot::Sender<String>>,
 }
 
 impl CmdInput {
-    pub fn new(default: String) -> (CmdInput, oneshot::Receiver<String>) {
+    pub fn new(title: String, default: String) -> (CmdInput, oneshot::Receiver<String>) {
         let (tx, rx) = oneshot::channel();
         (
             Self {
+                title,
                 contents: default,
                 tx: Some(tx),
             },
@@ -164,7 +192,7 @@ impl Drawable for CmdInput {
         let cursor = Span::raw("█").style(Style::default().add_modifier(Modifier::SLOW_BLINK));
         let line = Line::from(vec![Span::raw(&self.contents), cursor]);
         let p = Paragraph::new(Text::from(line))
-            .block(Block::bordered())
+            .block(Block::bordered().title_bottom(Line::raw(&self.title).centered()))
             .left_aligned();
         frame.render_widget(p, area);
     }

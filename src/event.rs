@@ -280,6 +280,7 @@ pub fn new_filewatcher(
     file: &Path,
     cmd: String,
     events: Messenger,
+    autorun: bool,
 ) -> Result<mpsc::UnboundedSender<ToFileWatcher>> {
     let (tx, rx) = mpsc::unbounded_channel();
     let (to_watcher, from_app) = mpsc::unbounded_channel();
@@ -290,7 +291,7 @@ pub fn new_filewatcher(
         file.to_str().ok_or_eyre("Unable to parse binary path")?,
     );
     let cmd = shlex::split(&cmd).ok_or_eyre("Unable to parse command")?;
-    tokio::spawn(async {
+    tokio::spawn(async move {
         let mut u = UploaderImpl {
             _watcher: watcher,
             events: rx,
@@ -299,6 +300,9 @@ pub fn new_filewatcher(
             from_app,
             alive: true,
         };
+        if autorun {
+            u.exec();
+        }
         while u.alive {
             u.run().await;
         }

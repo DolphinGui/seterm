@@ -10,6 +10,7 @@ pub mod device_finder;
 pub mod event;
 pub mod fileviewer;
 pub mod ui;
+pub mod notif;
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
@@ -26,14 +27,13 @@ async fn main() -> color_eyre::Result<()> {
 
     color_eyre::install()?;
     let terminal = ratatui::init();
-    let dev = args.device.map(|p| p.into_os_string().into_string());
-    let dev = match dev {
-        Some(Ok(d)) => Some(d),
-        Some(Err(_)) => return Err(eyre!("Unable to parse non-utf8 strings!")),
-        None => None,
-    };
     let result = App::new()
-        .run(terminal, args.default_baud, dev, "".into())
+        .run(
+            terminal,
+            args.device,
+            args.default_cmd.unwrap_or_default(),
+            None,
+        )
         .await;
     ratatui::restore();
     result

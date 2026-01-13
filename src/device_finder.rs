@@ -1,4 +1,4 @@
-use std::mem::take;
+use std::{mem::take, path::PathBuf};
 
 use clap::ValueEnum;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -171,26 +171,13 @@ impl Drawable for DeviceFinder {
 
 #[derive(Clone, Debug)]
 pub struct DeviceConfig {
-    path: String,
-    baud: Baud,
-    bits: DataBits,
-    flow: FlowControl,
-    parity: Parity,
-    stop: StopBits,
-    dtr: bool,
-}
-
-impl DeviceConfig {
-    pub fn to_serial(self) -> Result<SerialStream> {
-        tokio_serial::new(self.path, self.baud as u32)
-            .data_bits(self.bits)
-            .flow_control(self.flow)
-            .parity(self.parity)
-            .stop_bits(self.stop)
-            .dtr_on_open(self.dtr)
-            .open_native_async()
-            .map_err(|e| e.into())
-    }
+    pub path: PathBuf,
+    pub baud: Baud,
+    pub bits: DataBits,
+    pub flow: FlowControl,
+    pub parity: Parity,
+    pub stop: StopBits,
+    pub dtr: bool,
 }
 
 pub struct DeviceConfigurer {
@@ -201,12 +188,12 @@ pub struct DeviceConfigurer {
 
 impl Default for DeviceConfig {
     fn default() -> Self {
-        Self::new(String::default(), Baud::B1152)
+        Self::new(Default::default(), Baud::B1152)
     }
 }
 
 impl DeviceConfig {
-    fn new(path: String, baud: Baud) -> Self {
+    pub fn new(path: PathBuf, baud: Baud) -> Self {
         Self {
             path,
             baud,
@@ -217,15 +204,26 @@ impl DeviceConfig {
             dtr: true,
         }
     }
+
+    pub fn to_serial(self) -> Result<SerialStream> {
+        tokio_serial::new(self.path.to_string_lossy(), self.baud as u32)
+            .data_bits(self.bits)
+            .flow_control(self.flow)
+            .parity(self.parity)
+            .stop_bits(self.stop)
+            .dtr_on_open(self.dtr)
+            .open_native_async()
+            .map_err(|e| e.into())
+    }
 }
 
 impl DeviceConfigurer {
-    pub fn new(path: String, baud: Baud) -> (Self, oneshot::Receiver<DeviceConfig>) {
+    pub fn new(default: DeviceConfig) -> (Self, oneshot::Receiver<DeviceConfig>) {
         let (tx, rx) = oneshot::channel();
         let tx = Some(tx);
         (
             Self {
-                config: DeviceConfig::new(path, baud),
+                config: default,
                 table_state: TableState::new(),
                 tx,
             },
@@ -324,7 +322,7 @@ impl Drawable for DeviceConfigurer {
         let rows = [
             Row::new([
                 Text::raw("Path").left_aligned(),
-                Text::raw(&self.config.path).centered(),
+                Text::raw(self.config.path.to_string_lossy()).centered(),
             ]),
             Row::new([
                 Text::raw("Baud Rate").left_aligned(),
